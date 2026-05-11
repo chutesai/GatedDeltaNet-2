@@ -148,7 +148,7 @@ We train 1.3B-parameter models on 100B tokens of FineWeb-Edu with:
 
 ## 📜 License
 
-Copyright © 2025, NVIDIA Corporation. All rights reserved.
+Copyright © 2026, NVIDIA Corporation. All rights reserved.
 
 Licensed under the NVIDIA Source Code License-NC. See [LICENSE](LICENSE) for details.
 
