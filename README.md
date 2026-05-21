@@ -4,7 +4,7 @@ Official PyTorch implementation of **Gated DeltaNet-2: Decoupling Erase and Writ
 
 [![Star on GitHub](https://img.shields.io/github/stars/NVlabs/GatedDeltaNet-2.svg?style=social)](https://github.com/NVlabs/GatedDeltaNet-2/stargazers)
 
-[Ali Hatamizadeh](https://research.nvidia.com/person/ali-hatamizadeh),
+[Ali Hatamizadeh](https://ahatamiz.github.io),
 [Yejin Choi](https://homes.cs.washington.edu/~yejin/), and
 [Jan Kautz](https://jankautz.com/).
 
