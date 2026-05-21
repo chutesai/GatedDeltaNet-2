@@ -19,8 +19,6 @@ from lit_gpt.config import Config
 from .fused_rotary_embedding import apply_rotary_emb_func
 
 from .gdn2 import GatedDeltaNet2
-from .gdn2_plus import GatedDeltaNet2Plus
-
 
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
@@ -195,7 +193,7 @@ class GPT(nn.Module):
         caches: List[Optional[KVCache]] = []
         for i in range(self.config.n_layer):
             block = self.transformer.h[i]
-            if block.use_gdn2 or block.use_gdn2_plus:
+            if block.use_gdn2:
                 caches.append(None)
             else:
                 caches.append((
@@ -209,24 +207,11 @@ class Block(nn.Module):
     def __init__(self, config: Config, layer_idx: int) -> None:
         super().__init__()
         self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-
         self.use_gdn2 = layer_idx % config.gdn2_per_layer == 0 if config.gdn2_per_layer > 0 else False
-        self.use_gdn2_plus = (
-            layer_idx % config.gdn2_plus_per_layer == 0 if config.gdn2_plus_per_layer > 0 else False
-        )
-        if self.use_gdn2 and self.use_gdn2_plus:
-            raise ValueError(
-                f"layer {layer_idx}: both gdn2_per_layer and gdn2_plus_per_layer match; "
-                "set only one of them to a positive value"
-            )
-
         if self.use_gdn2:
             self.attn = GatedDeltaNet2(hidden_size=config.n_embd)
-        elif self.use_gdn2_plus:
-            self.attn = GatedDeltaNet2Plus(hidden_size=config.n_embd)
         else:
             self.attn = CausalSelfAttention(config, n_embd=config.n_embd, layer_idx=layer_idx)
-
         if not config.shared_attention_norm and config.mlp and not config.parallel_residual:
             self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
         if config.mlp:
@@ -243,7 +228,7 @@ class Block(nn.Module):
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         n_1 = self.norm_1(x)
-        if self.use_gdn2 or self.use_gdn2_plus:
+        if self.use_gdn2:
             h, _, new_kv_cache = self.attn(n_1, attention_mask=None)
         else:
             h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)

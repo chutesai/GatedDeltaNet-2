@@ -5,6 +5,40 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+r"""
+Chunkwise Triton kernels for KDA (Kimi Delta Attention).
+
+KDA is a gated delta-rule linear attention with a channel-wise decay. On the
+matrix state ``S`` in ``R^{d_k x d_v}`` the per-token recurrence is
+
+    S_t = (I - beta_t k_t k_t^T) Diag(alpha_t) S_{t-1} + beta_t k_t v_t^T
+
+where ``beta_t`` is a scalar write-strength gate and ``alpha_t`` is the
+channel-wise decay on the key axis.
+
+Training uses a chunkwise schedule: the sequence is split into chunks, the
+recurrence runs between chunks, and intra-chunk token interactions are
+expressed as dense matmuls via a WY representation. This file provides the
+forward and backward kernels, their Python orchestration wrappers, and the
+``torch.autograd.Function`` that ties them together.
+
+This module is part of the flash-linear-attention project and is reused by
+GDN-2: GDN-2's inter-chunk state recurrence and gate-activation kernels are
+imported from here rather than reimplemented.
+
+Layout of this file
+-------------------
+  1. Inter-chunk state recurrence (the ``_h`` / ``_dhu`` kernels), including
+     the context-parallel pre/post-processing helpers.
+  2. WY representation: intra-chunk score matrices, the triangular solve, and
+     the w/u auxiliary construction (forward and backward).
+  3. Decay-gate activation kernels and their autograd wrapper.
+  4. Chunk-level forward and backward orchestration.
+  5. ``ChunkKDAFunction`` autograd Function and the public ``chunk_kda`` entry.
+
+Public entry point: ``chunk_kda``.
+"""
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -35,6 +69,15 @@ from fla.utils import (
 )
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
+
+# =============================================================================
+# SECTION 1: INTER-CHUNK STATE RECURRENCE
+# -----------------------------------------------------------------------------
+# Kernels that carry the recurrent state S across chunk boundaries, plus the
+# context-parallel pre/post-processing helpers that gather and scatter the
+# per-rank chunk states. These kernels are layout-agnostic about the gates;
+# they consume the post-WY auxiliaries produced by Section 2.
+# =============================================================================
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
@@ -1567,6 +1610,12 @@ def chunk_gated_delta_rule_fwd_h(
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Inter-chunk state recurrence (forward).
+
+    Carries the recurrent state across chunk boundaries given the per-chunk
+    WY auxiliaries, and returns the per-chunk states, the new values, and the
+    final state. Shared with GDN-2.
+    """
     B, T, Hq, K = k.shape
     V = u.shape[-1]
     H = u.shape[2]
@@ -1630,6 +1679,12 @@ def chunk_gated_delta_rule_bwd_dhu(
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Inter-chunk state recurrence (backward).
+
+    Propagates the state gradient across chunk boundaries, returning the
+    gradients of the per-chunk state, the initial state, and the values.
+    Shared with GDN-2.
+    """
     B, T, Hq, K = q.shape
     V = do.shape[-1]
     H = do.shape[2]
@@ -1677,6 +1732,16 @@ def chunk_gated_delta_rule_bwd_dhu(
         TRANSPOSE_STATE=transpose_state_layout,
     )
     return dh, dh0, dv2
+
+
+# =============================================================================
+# SECTION 2: WY REPRESENTATION
+# -----------------------------------------------------------------------------
+# Intra-chunk machinery. Builds the causal query-key and key-key score
+# matrices, solves the WY inverse A = (I + T)^{-1}, and constructs the w / u
+# auxiliary blocks (pseudo-keys and pseudo-values) that the inter-chunk
+# recurrence and the output kernel consume. Both forward and backward.
+# =============================================================================
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -2181,6 +2246,15 @@ def naive_kda_lowerbound_gate(
         g = g + dt_bias.view(H, -1)
     g = lower_bound * F.sigmoid(A_log.view(H, 1).exp() * g)
     return g.to(output_dtype)
+
+
+# =============================================================================
+# SECTION 3: DECAY-GATE ACTIVATION
+# -----------------------------------------------------------------------------
+# Kernels and autograd wrapper that turn the raw decay-gate pre-activation
+# into the channel-wise log-decay used by the recurrence, including the
+# chunk-local cumulative sum. `naive_kda_gate` is the reference PyTorch path.
+# =============================================================================
 
 @triton.heuristics({
     "HAS_BIAS": lambda args: args["dt_bias"] is not None,
@@ -3450,6 +3524,15 @@ def chunk_kda_bwd_intra(
 
     return dq, dk, db, dg
 
+
+# =============================================================================
+# SECTION 4: CHUNK-LEVEL FORWARD AND BACKWARD ORCHESTRATION
+# -----------------------------------------------------------------------------
+# Python-level drivers that chain the kernels of Sections 1-3 into the full
+# chunkwise forward and backward passes, allocating intermediate buffers and
+# handling variable-length / context-parallel layouts.
+# =============================================================================
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3473,6 +3556,13 @@ def chunk_kda_fwd(
     cp_context: FLACPContext | None = None,
     transpose_state_layout: bool = False,
 ):
+    """Full chunkwise forward pass for KDA.
+
+    Applies the gate activation, builds the WY representation, runs the
+    inter-chunk state recurrence, and produces the chunk outputs. Returns the
+    output tensor, the final state, and the intermediate tensors that the
+    backward pass needs.
+    """
     # Apply gate activation
     g_org = None
     if use_gate_in_kernel:
@@ -3975,6 +4065,13 @@ def chunk_kda_bwd(
     transpose_state_layout: bool = False,
     **kwargs,
 ):
+    """Full chunkwise backward pass for KDA.
+
+    Mirrors `chunk_kda_fwd`: recomputes intermediates when needed, then
+    propagates gradients through the output equation, the inter-chunk state
+    recurrence, the WY representation, and the gate activation. Returns the
+    gradients for every differentiable input.
+    """
     if disable_recompute is False:
         if use_gate_in_kernel:
             g = kda_gate_chunk_cumsum(
@@ -4123,6 +4220,14 @@ def chunk_kda_bwd(
         )
 
     return dq, dk, dv, db, dg, dh0, dA, dbias
+
+
+# =============================================================================
+# SECTION 5: AUTOGRAD AND PUBLIC API
+# -----------------------------------------------------------------------------
+# `ChunkKDAFunction` ties the forward and backward orchestration into a
+# torch.autograd.Function. `chunk_kda` is the public entry point.
+# =============================================================================
 
 class ChunkKDAFunction(torch.autograd.Function):
     @staticmethod

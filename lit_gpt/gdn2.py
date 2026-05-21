@@ -6,6 +6,25 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+r"""
+GDN-2 (Gated DeltaNet 2) token-mixing layer.
+
+This module defines `GatedDeltaNet2`, the `nn.Module` that wraps the GDN-2
+recurrence into a drop-in token mixer for a Transformer-style block. It
+handles projections, short convolutions, gate construction, kernel dispatch,
+caching for incremental decoding, and the gated output normalization.
+
+The recurrence itself is implemented by the Triton kernels in `gdn2_ops`;
+this layer only prepares their inputs and consumes their outputs. Two kernels
+are dispatched between automatically: the chunkwise kernel `chunk_gdn2` for
+training and long sequences, and the token-by-token `fused_recurrent_gdn2`
+for short-sequence decoding.
+
+GDN-2 replaces the scalar write-strength gate of the gated delta rule with two
+independent channel-wise gates: an erase gate `b` on the key axis and a write
+gate `w` on the value axis. See the kernel modules for the recurrence itself.
+"""
+
 from __future__ import annotations
 
 import math
@@ -132,10 +151,14 @@ class GatedDeltaNet2(nn.Module):
             )
         assert mode in ["chunk", "fused_recurrent"], f"Not supported mode `{mode}`."
 
+        # Query / key / value projections.
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
 
+        # Optional depthwise short convolutions on q, k, v. These give the
+        # model a small local receptive field before the recurrence and are
+        # standard in the gated delta rule family.
         if use_short_conv:
             self.q_conv1d = ShortConvolution(
                 hidden_size=self.key_dim,
@@ -156,14 +179,22 @@ class GatedDeltaNet2(nn.Module):
                 activation="silu",
             )
 
+        # Decay-gate projection. Produces the pre-activation that, combined
+        # with A_log and dt_bias below, yields the channel-wise log-decay g.
         self.f_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
             nn.Linear(self.head_v_dim, self.key_dim, bias=False),
         )
 
+        # GDN-2 channel-wise gates. b_proj produces the erase gate on the key
+        # axis; w_proj produces the write gate on the value axis. Together
+        # they replace the single scalar write-strength gate of KDA.
         self.b_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.w_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
 
+        # Decay-gate parameters. A_log is a per-head log-rate; dt_bias is a
+        # per-channel bias initialized so the softplus step-size starts in a
+        # small range. Both are excluded from weight decay.
         self.A_log = nn.Parameter(torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)))
         self.A_log._no_weight_decay = True
         dt = torch.exp(
@@ -173,6 +204,7 @@ class GatedDeltaNet2(nn.Module):
         self.dt_bias = nn.Parameter(inv_dt)
         self.dt_bias._no_weight_decay = True
 
+        # Output path: SiLU-gated RMS norm followed by the output projection.
         self.g_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
             nn.Linear(self.head_v_dim, self.value_dim, bias=True),
@@ -182,6 +214,11 @@ class GatedDeltaNet2(nn.Module):
         self.apply(self._initialize_weights)
 
     def _initialize_weights(self, module: nn.Module):
+        """Xavier-uniform init for all linear layers, applied via `self.apply`.
+
+        The `_is_hf_initialized` guard makes this idempotent so that weights
+        loaded by HuggingFace `from_pretrained` are not overwritten.
+        """
         if getattr(module, "_is_hf_initialized", False):
             return
         if isinstance(module, nn.Linear):
@@ -199,6 +236,27 @@ class GatedDeltaNet2(nn.Module):
         output_attentions: bool | None = False,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        """Run the GDN-2 token mixer.
+
+        Projects the input to q/k/v and the three gates, dispatches to the
+        chunkwise or recurrent kernel, updates the incremental-decoding cache,
+        and applies the gated output normalization and projection.
+
+        Args:
+            hidden_states: input of shape `[B, T, hidden_size]`.
+            attention_mask: optional `[B, T]` 0/1 padding mask. When given,
+                the batch is unpadded into a single packed sequence and
+                repadded on the way out.
+            past_key_values: optional cache holding the recurrent state and
+                short-convolution state from previous steps.
+            use_cache: whether to write the updated state back into the cache.
+            output_attentions: unused; kept for interface compatibility.
+
+        Returns:
+            A tuple `(o, None, past_key_values)` where `o` has shape
+            `[B, T, hidden_size]`. The second element is always `None`
+            (GDN-2 has no attention map to return).
+        """
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
@@ -207,6 +265,8 @@ class GatedDeltaNet2(nn.Module):
             )
 
         batch_size, q_len, _ = hidden_states.shape
+        # Short non-training sequences use the lower-latency recurrent kernel;
+        # training and long sequences use the chunkwise kernel.
         mode = "fused_recurrent" if (q_len <= 64 and not self.training) else self.mode
         if self.training:
             assert mode == "chunk", "Only chunk mode is supported in training."
@@ -245,25 +305,38 @@ class GatedDeltaNet2(nn.Module):
             k = F.silu(self.k_proj(hidden_states))
             v = F.silu(self.v_proj(hidden_states))
 
+        # Channel-wise log-decay, computed in fp32 for numerical stability of
+        # the downstream cumulative sum. A_log is per-head and broadcast over
+        # the head's key channels; dt_bias is per-channel.
         g = (
             -self.A_log.float().exp().repeat_interleave(self.head_k_dim)
             * F.softplus(self.f_proj(hidden_states).float() + self.dt_bias)
         )
 
+        # GDN-2 gates, both squashed to [0, 1] by a sigmoid. b is the
+        # channel-wise erase gate (key axis); w is the channel-wise write
+        # gate (value axis).
         b = self.b_proj(hidden_states).sigmoid()
         w = self.w_proj(hidden_states).sigmoid()
 
+        # Split the flat projection outputs into per-head tensors. Key-side
+        # tensors (q, k, g, b) use head_k_dim; value-side (v, w) use head_v_dim.
         q, k, g = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k, g))
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
         b = rearrange(b, "... (h d) -> ... h d", d=self.head_k_dim)
         w = rearrange(w, "... (h d) -> ... h d", d=self.head_v_dim)
 
+        # Grouped value attention: when there are more value heads than key
+        # heads, replicate the key-side tensors across each value-head group.
         if self.num_v_heads > self.num_heads:
             q, k, g, b = (
                 repeat(x, "... h d -> ... (h g) d", g=self.num_v_heads // self.num_heads)
                 for x in (q, k, g, b)
             )
 
+        # Optionally lift the erase gate from [0, 1] into [0, 2], which allows
+        # negative eigenvalues in the state transition (extra state-tracking
+        # capacity). The write gate w is left in [0, 1].
         if self.allow_neg_eigval:
             b = b * 2.0
 
@@ -303,6 +376,8 @@ class GatedDeltaNet2(nn.Module):
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
+        # Persist the recurrent state and short-conv state for the next
+        # incremental-decoding step.
         update_layer_cache(
             self,
             past_key_values,
@@ -311,6 +386,8 @@ class GatedDeltaNet2(nn.Module):
             offset=q_len,
         )
 
+        # SiLU-gated RMS norm on the recurrent output, then project back to
+        # the model dimension. Repad if the input batch was unpadded above.
         o = self.o_norm(o, rearrange(self.g_proj(hidden_states), "... (h d) -> ... h d", d=self.head_v_dim))
         o = rearrange(o, "b t h d -> b t (h d)")
         o = self.o_proj(o)

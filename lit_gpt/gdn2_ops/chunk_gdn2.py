@@ -6,6 +6,53 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+r"""
+Chunkwise Triton kernels for GDN-2 (Gated DeltaNet 2).
+
+GDN-2 extends the gated delta rule with two independent channel-wise gates.
+The per-token recurrence on the matrix state ``S_t`` in ``R^{d_k x d_v}`` is
+
+    S_t = (I - k_t (b_t * k_t)^T) Diag(alpha_t) S_{t-1} + k_t (w_t * v_t)^T
+
+where ``*`` is the elementwise (Hadamard) product, ``b_t`` in ``[0,1]^{d_k}``
+is the channel-wise erase gate on the key axis, ``w_t`` in ``[0,1]^{d_v}`` is
+the channel-wise write gate on the value axis, and ``alpha_t`` is the
+channel-wise decay. Setting ``b_t`` and ``w_t`` to a shared scalar broadcast
+recovers KDA; further collapsing ``alpha_t`` to a scalar recovers Gated
+DeltaNet.
+
+Training uses a chunkwise schedule: the sequence is split into chunks of size
+``C = 64``, the recurrence runs between chunks, and all intra-chunk token
+interactions are expressed as dense matmuls via a WY representation. This
+keeps complexity linear in sequence length and maps onto tensor cores.
+
+Pipeline
+--------
+Forward (see ``chunk_gdn2_fwd``):
+  1. ``chunk_gdn2_fwd_kernel_intra_token_parallel``  - intra-chunk Q-K and
+     gated K-K score matrices (Aqk, Akk).
+  2. ``chunk_gdn2_fwd_kernel_intra_sub_chunk``       - sub-chunk refinement
+     of the score matrices.
+  3. ``chunk_gdn2_fwd_kernel_inter_solve_fused``     - WY triangular solve
+     A = (I + T)^{-1} and construction of the WY auxiliaries.
+  4. ``recompute_w_u_fwd_gdn2_kernel``               - gate-aware pseudo-key
+     / pseudo-value blocks (w_wy, u_wy).
+  The inter-chunk state recurrence and the output kernel are shared with the
+  gated delta rule / KDA path and imported from ``chunk_kda``.
+
+Backward (see ``chunk_gdn2_bwd``):
+  - ``chunk_gdn2_bwd_kernel_wy_dqkg_fused`` - gate-aware vector-Jacobian
+    product through the WY inverse. The channel-wise gates are baked into the
+    dA accumulation directly; a scalar post-scale (valid for scalar-beta
+    models) cannot reconstruct two independent gates living on different axes.
+  - ``chunk_gdn2_bwd_kernel_intra``         - intra-chunk gradients for Q, K,
+    the erase gate, and the cumulative decay.
+  The dAv and dhu backward kernels are shared with KDA.
+
+Public entry point: ``chunk_gdn2``. Autograd wrapper: ``ChunkGDN2Function``.
+All other names are internal orchestration or Triton kernels.
+"""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -29,20 +76,31 @@ from fla.utils import (
     input_guard,
 )
 
-
 NUM_WARPS_WY = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 NUM_WARPS_INTRA = [1, 2, 4] if IS_NVIDIA_HOPPER else [1, 2, 4, 8]
 NUM_WARPS_GENERIC = [1, 2, 4] if IS_NVIDIA_HOPPER else [1, 2, 4, 8]
 
 from .chunk_kda import (
-    chunk_gated_delta_rule_fwd_h,   
-    chunk_gated_delta_rule_bwd_dhu, 
+    chunk_gated_delta_rule_fwd_h,    
+    chunk_gated_delta_rule_bwd_dhu,  
     chunk_kda_bwd_dAv,               
-    kda_gate_chunk_cumsum,          
+    kda_gate_chunk_cumsum,           
     kda_gate_bwd,                    
 )
 
-
+# =============================================================================
+# FORWARD KERNELS
+# =============================================================================
+# Kernel 1: chunk_gdn2_fwd_kernel_intra_token_parallel
+# -----------------------------------------------------------------------------
+# Builds the two intra-chunk score matrices used by the WY solve:
+#   Aqk - causal query-key scores, decay-weighted, for the output path.
+#   Akk - gated key-key scores (the strictly-lower matrix T whose inverse
+#         (I + T)^{-1} defines the WY representation). The erase gate b is
+#         folded into the key tile before the dot product, which is the only
+#         GDN-2-specific change relative to the gated delta rule.
+# Token-parallel: each program handles a block of tokens within one chunk.
+# =============================================================================
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -188,6 +246,14 @@ def chunk_gdn2_fwd_intra_token_parallel(
     return Aqk, Akk
 
 
+# =============================================================================
+# Kernel 2: chunk_gdn2_fwd_kernel_intra_sub_chunk
+# -----------------------------------------------------------------------------
+# Refines the score matrices at sub-chunk granularity. The chunk is split into
+# smaller sub-chunks; this kernel fills the off-diagonal sub-chunk blocks of
+# Aqk and Akk that the token-parallel kernel above leaves to a second pass.
+# Together kernels 1 and 2 produce the complete intra-chunk score matrices.
+# =============================================================================
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -300,6 +366,16 @@ def chunk_gdn2_fwd_kernel_intra_sub_chunk(
 SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32' if check_shared_mem() else 'ieee')
 
 
+# =============================================================================
+# Kernel 3: chunk_gdn2_fwd_kernel_inter_solve_fused
+# -----------------------------------------------------------------------------
+# Solves the WY representation. Given the gated key-key matrix T (= Akk), this
+# computes A = (I + T)^{-1} by blocked forward substitution. The triangular
+# solve is the most precision-sensitive step in the chunk, so its matmuls run
+# at the precision picked by SOLVE_TRIL_DOT_PRECISION above: fp32 (ieee) when
+# shared memory allows it, tf32 otherwise. The resulting A is consumed by the
+# pseudo-key / pseudo-value construction in kernel 4.
+# =============================================================================
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -714,6 +790,12 @@ def recompute_w_u_fwd_gdn2_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
+# =============================================================================
+# FORWARD ORCHESTRATION
+# -----------------------------------------------------------------------------
+# Python-level wrappers that launch the Triton kernels above, allocate output
+# buffers, and chain the forward pipeline together.
+# =============================================================================
 def chunk_gdn2_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1125,6 +1207,28 @@ def chunk_gdn2(
         transpose_state_layout,
     )
 
+
+# =============================================================================
+# BACKWARD KERNELS
+# =============================================================================
+# Kernel: chunk_gdn2_bwd_kernel_wy_dqkg_fused
+# -----------------------------------------------------------------------------
+# Gate-aware vector-Jacobian product through the WY inverse. This is the
+# central GDN-2-specific backward kernel.
+#
+# For a scalar write strength beta, the contribution of u to dA factors as
+# dU @ (beta * V)^T = beta * (dU @ V^T), so beta can be applied as a scalar
+# post-scale after a gate-free matmul. GDN-2 replaces beta with the
+# channel-wise gates b and w, which live on different axes and act as a
+# different per-row diagonal at every row. No scalar post-scale can recover
+# them, so the gates are baked directly into the dA accumulation here:
+#   dA += dU @ (w * V)^T        (write gate, value axis)
+#   dA += dW @ (b * exp(gk) * K)^T   (erase gate, key axis)
+# The kernel also emits dq, dk, dg, db, and dw.
+#
+# Hopper note: the (BK=32, num_warps=4) config is filtered out in the autotune
+# list above to avoid a WGMMA layout assertion (see NUM_WARPS_WY).
+# =============================================================================
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -1317,6 +1421,14 @@ def chunk_gdn2_bwd_kernel_wy_dqkg_fused(
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
 
 
+# =============================================================================
+# Kernel: chunk_gdn2_bwd_kernel_intra
+# -----------------------------------------------------------------------------
+# Intra-chunk backward. Given the gradients dAqk and dAkk on the two score
+# matrices, this accumulates the within-chunk contributions to dq, dk, the
+# erase gate db, and the cumulative decay dg. The decay gradient is reduced by
+# a reverse cumulative sum across the chunk.
+# =============================================================================
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -1593,6 +1705,12 @@ def chunk_gdn2_bwd_kernel_intra(
     tl.store(p_dg2, b_dg2.to(p_dg2.dtype.element_ty), boundary_check=(0, 1))
 
 
+# =============================================================================
+# BACKWARD ORCHESTRATION
+# -----------------------------------------------------------------------------
+# Python-level wrappers that launch the backward Triton kernels and assemble
+# the full gradient set for the chunkwise backward pass.
+# =============================================================================
 def chunk_gdn2_bwd_wy_dqkg_fused(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1896,6 +2014,14 @@ def chunk_gdn2_bwd(
     return dq, dk, dv, db, dw, dg, dh0, dA_log, dt_bias_grad
 
 
+# =============================================================================
+# AUTOGRAD AND PUBLIC API
+# -----------------------------------------------------------------------------
+# `ChunkGDN2Function` is the torch.autograd.Function that ties the forward and
+# backward orchestration together. `chunk_gdn2` (defined earlier) is the public
+# entry point that callers should use; it normalizes arguments and dispatches
+# through this Function so that gradients are tracked.
+# =============================================================================
 class ChunkGDN2Function(torch.autograd.Function):
     """Autograd-compatible wrapper around GDN-2 forward/backward.
 
@@ -2063,19 +2189,10 @@ class ChunkGDN2Function(torch.autograd.Function):
 __all__ = [
     "chunk_gdn2",
     "ChunkGDN2Function",
-    # Forward entry points
     "chunk_gdn2_fwd",
     "chunk_gdn2_fwd_intra",
     "recompute_w_u_fwd_gdn2",
-    # Backward entry points
     "chunk_gdn2_bwd",
     "chunk_gdn2_bwd_wy_dqkg_fused",
     "chunk_gdn2_bwd_intra",
-    # Triton kernels (exposed for debugging)
-    "chunk_gdn2_fwd_kernel_intra_token_parallel",
-    "chunk_gdn2_fwd_kernel_intra_sub_chunk",
-    "chunk_gdn2_fwd_kernel_inter_solve_fused",
-    "recompute_w_u_fwd_gdn2_kernel",
-    "chunk_gdn2_bwd_kernel_wy_dqkg_fused",
-    "chunk_gdn2_bwd_kernel_intra",
 ]

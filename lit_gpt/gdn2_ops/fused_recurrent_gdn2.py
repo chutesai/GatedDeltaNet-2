@@ -6,6 +6,36 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+r"""
+Token-by-token recurrent kernel for GDN-2 (Gated DeltaNet 2).
+
+This is the inference-time counterpart of the chunkwise training kernels. It
+runs the GDN-2 recurrence one token at a time, with no chunk padding, which
+makes it the preferred path for autoregressive decoding at short sequence
+lengths. It is forward-only and does not track gradients; training always uses
+the chunkwise kernels.
+
+Per token, the matrix state ``S`` in ``R^{d_k x d_v}`` is updated by
+
+    S <- Diag(alpha) * S                  # channel-wise decay
+    v_new = (w * v) - (b * k)^T S          # gated write minus gated read
+    S <- S + k (v_new)^T                   # rank-one write
+    o = S^T q                              # output read
+
+where ``*`` is the elementwise product, ``b`` is the channel-wise erase gate
+on the key axis, ``w`` is the channel-wise write gate on the value axis, and
+``alpha`` is the channel-wise decay. This is the same recurrence the chunkwise
+path implements, just unrolled token-serially.
+
+The kernel supports the inference features expected by a serving stack:
+packed variable-length sequences (``cu_seqlens``), continuous batching with a
+paged state pool (``ssm_state_indices``), and speculative decoding
+(``num_accepted_tokens``). It can also fuse the decay-gate activation
+(``use_gate_in_kernel``) so the caller can pass raw pre-activations.
+
+Public entry point: ``fused_recurrent_gdn2``.
+"""
+
 from __future__ import annotations
 
 import torch
@@ -17,6 +47,25 @@ from fla.ops.utils.softplus import softplus
 from fla.utils import input_guard
 
 
+# =============================================================================
+# RECURRENT FORWARD KERNEL
+# -----------------------------------------------------------------------------
+# fused_recurrent_gdn2_fwd_kernel
+#
+# Each program owns one (sequence, value-head, K-block, V-block) tile and
+# walks the tokens of that sequence serially, carrying the state tile b_h in
+# registers. The per-token body is the four-line recurrence from the module
+# docstring: decay, gated read/write, rank-one update, output read.
+#
+# State layout is selectable via TRANSPOSE_STATE: the default is [K, V];
+# transposed is [V, K]. Both branches appear throughout because the serving
+# stack may request either layout.
+#
+# Continuous batching: when ssm_state_indices is given, the per-sequence state
+# is fetched from (and written back to) a paged pool indexed by those indices,
+# rather than a contiguous [N, HV, K, V] buffer. Speculative decoding uses
+# num_accepted_tokens to pick the correct rolled-back state slot.
+# =============================================================================
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -71,6 +120,8 @@ def fused_recurrent_gdn2_fwd_kernel(
     TRANSPOSE_STATE: tl.constexpr,
     num_stages: tl.constexpr,
 ):
+    # Decompose the flat program id into (K-block, V-block, sequence,
+    # value-head). i_h maps the value-head back to its key-head for GVA.
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
     NK = tl.cdiv(K, BK)
@@ -226,6 +277,9 @@ def fused_recurrent_gdn2_fwd_kernel(
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
+# =============================================================================
+# ORCHESTRATION AND PUBLIC API
+# =============================================================================
 @torch.compiler.disable
 def fused_recurrent_gdn2_fwd(
     q: torch.Tensor,
@@ -250,6 +304,20 @@ def fused_recurrent_gdn2_fwd(
     transpose_state_layout: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate buffers and launch the recurrent forward kernel.
+
+    Internal launcher. Most callers should use `fused_recurrent_gdn2`, which
+    adds argument validation. This function resolves the output and
+    final-state buffers, computes the state-pool strides needed for continuous
+    batching, builds the launch grid, and invokes the kernel.
+
+    The `inplace_final_state` path writes the final state back into
+    `initial_state` (used by serving stacks that own a persistent state pool);
+    `output_final_state` instead allocates a fresh final-state buffer.
+
+    Args mirror `fused_recurrent_gdn2`, plus `out` (optional preallocated
+    output buffer) and `inplace_final_state`. Returns `(out, final_state)`.
+    """
     if scale is None:
         scale = k.shape[-1] ** -0.5
 

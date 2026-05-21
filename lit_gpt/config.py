@@ -31,7 +31,6 @@ class Config:
     local_window: int = -1
     mlp: bool = True
     gdn2_per_layer: int = -1
-    gdn2_plus_per_layer: int = -1
     nope: bool = False
     mamba_init: bool = False
     # to use multi-head attention (MHA), set this to `n_head` (default)
@@ -149,47 +148,7 @@ configs = [
         intermediate_size=6784,
         local_window=2048,
         mamba_init=True,
-    ),
-    dict(
-        org="NVIDIA",
-        name="gdn2_plus_1.3B", # Total parameters 1,300,278,816
-        block_size=4096,
-        vocab_size=32000,
-        padding_multiple=64,
-        gdn2_plus_per_layer=1,
-        n_layer=18,
-        n_head=18,
-        n_embd=2304,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="FusedRMSNorm",
-        norm_eps=1e-5,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=3456,
-        local_window=2048,
-        mamba_init=True,
-    ),
-    dict(
-        org="NVIDIA",
-        name="swa_gdn2_plus_1.3B", # Total parameters 1,303,116,048
-        block_size=4096,
-        vocab_size=32000,
-        padding_multiple=64,
-        gdn2_plus_per_layer=2,
-        n_layer=18,
-        n_head=18,
-        n_embd=2304,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="FusedRMSNorm",
-        norm_eps=1e-5,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=5440,
-        local_window=2048,
-        mamba_init=True,
-    ),
+    )
 ]
 
 name_to_config = {config["name"]: config for config in configs}

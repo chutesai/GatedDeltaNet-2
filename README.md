@@ -1,10 +1,8 @@
-# 🔮 Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention
+# 🔺 Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention
 
 Official PyTorch implementation of **Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention**.
 
-[![PyTorch](https://img.shields.io/badge/PyTorch-ee4c2c?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/license-NVIDIA%20Source%20Code%20License--NC-green.svg)](LICENSE)
-[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org)
+[![Star on GitHub](https://img.shields.io/github/stars/NVlabs/GatedDeltaNet-2.svg?style=social)](https://github.com/NVlabs/GatedDeltaNet-2/stargazers)
 
 [Ali Hatamizadeh](https://research.nvidia.com/person/ali-hatamizadeh),
 [Yejin Choi](https://homes.cs.washington.edu/~yejin/), and
@@ -109,8 +107,7 @@ Ablations confirm both gates contribute, with the **erase gate `b_t` accounting 
 
 ## 📢 Latest Updates
 
-- `XX/XX/2025`: 🔥 **Code Release**: Train your own Gated DeltaNet-2 on FineWeb-Edu
-- `XX/XX/2025`: 📄 **Paper Release**: Gated DeltaNet-2 on arXiv
+- `05/21/2026`: 🔥 **Code Release**: Train your own Gated DeltaNet-2 on FineWeb-Edu
 - Watch this space for more exciting updates!
 
 
@@ -168,11 +165,11 @@ Built on the shoulders of giants:
 If you find this work useful, please consider citing:
 
 ```bibtex
-@article{hatamizadeh2025gateddeltanet2,
+@article{hatamizadeh2026gdn2,
   title   = {Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention},
   author  = {Hatamizadeh, Ali and Choi, Yejin and Kautz, Jan},
   journal = {arXiv preprint},
-  year    = {2025}
+  year    = {2026}
 }
 ```
 
