@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gated-deltanet-2"
+version = "0.1.0"
+description = "Official PyTorch implementation of Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "NVIDIA Source Code License-NC" }
+authors = [
+    { name = "Ali Hatamizadeh" },
+    { name = "Yejin Choi" },
+    { name = "Jan Kautz" },
+]
+keywords = [
+    "linear-attention",
+    "delta-rule",
+    "language-model",
+    "pytorch",
+    "deep-learning",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Minimal dependency set - only what the repo's own code imports.
+# The following are installed separately (custom build flags / git / nightly);
+# see requirements.txt:
+#   flash-attn==2.8.3, flash-linear-attention (git), torchdata (nightly).
+# `triton` ships bundled with the Linux torch wheel.
+dependencies = [
+    "torch==2.9.0",
+    "numpy",
+    "einops",
+    "transformers",
+    "datasets==2.20.0",
+    "lightning==2.1.2",
+    "wandb",
+    "sentencepiece",
+    "tokenizers",
+    "typing_extensions",
+]
+
+[project.urls]
+Repository = "https://github.com/NVlabs/GatedDeltaNet-2"
+
+[tool.setuptools]
+packages = ["lit_gpt"]

@@ -1,0 +1,50 @@
+# ===========================================================================
+# Gated DeltaNet-2 - minimal Python requirements
+# Trimmed to ONLY what the repo's own code imports (verified against source).
+#
+# Base image assumed: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+# System packages (apt, not pip): git
+#
+# Dropped from the Dockerfile - NOT imported by this repo:
+#   mamba-ssm, causal-conv1d        -> Mamba baseline only
+#   tilelang, quack-kernels         -> separate kernel experiments
+#   apache-tvm-ffi, torch-c-dlpack-ext, nvidia-cutlass-dsl, z3-solver,
+#   cloudpickle, ml-dtypes, psutil  -> tilelang/quack build stack
+#   xformers, lm-eval, mosaicml-streaming, jsonargparse, tensorboard,
+#   pandas, pyarrow, zstandard, cbor2, braceexpand, smart_open, opt_einsum
+#                                   -> unused (transitive deps resolve on their own)
+# ===========================================================================
+
+# --- Core ------------------------------------------------------------------
+torch==2.9.0
+numpy
+einops
+transformers
+datasets==2.20.0
+lightning==2.1.2
+wandb
+sentencepiece
+tokenizers
+typing_extensions
+
+# --- Build helpers (needed to compile flash-attn / fla from source) --------
+ninja
+packaging
+
+# ===========================================================================
+# MANUAL INSTALL - run AFTER `pip install -r requirements.txt`.
+# These need custom build flags / git sources and won't work as plain lines.
+#
+#   pip install --no-cache-dir "flash-attn==2.8.3" --no-build-isolation
+#
+#   pip install --no-cache-dir -U \
+#       git+https://github.com/sustcsonglin/flash-linear-attention \
+#       --no-build-isolation
+#
+#   pip uninstall torchdata -y || true
+#   pip install --pre --no-cache-dir torchdata \
+#       --index-url https://download.pytorch.org/whl/nightly
+#
+# Note: `triton` is imported by the repo but ships bundled with the Linux
+# `torch` wheel, so it does not need a separate line.
+# ===========================================================================
