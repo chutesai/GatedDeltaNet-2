@@ -1,6 +1,6 @@
 # 🔺 Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention
 
-Official PyTorch implementation of **Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention**.
+Official PyTorch implementation of [**Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention**](https://arxiv.org/abs/2605.22791).
 
 [![Star on GitHub](https://img.shields.io/github/stars/NVlabs/GatedDeltaNet-2.svg?style=social)](https://github.com/NVlabs/GatedDeltaNet-2/stargazers)
 
@@ -165,11 +165,11 @@ Built on the shoulders of giants:
 If you find this work useful, please consider citing:
 
 ```bibtex
-@article{hatamizadeh2026gdn2,
-  title   = {Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention},
-  author  = {Hatamizadeh, Ali and Choi, Yejin and Kautz, Jan},
-  journal = {arXiv preprint},
-  year    = {2026}
+@article{hatamizadeh2026gated,
+  title={Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention},
+  author={Hatamizadeh, Ali and Choi, Yejin and Kautz, Jan},
+  journal={arXiv preprint arXiv:2605.22791},
+  year={2026}
 }
 ```
 
