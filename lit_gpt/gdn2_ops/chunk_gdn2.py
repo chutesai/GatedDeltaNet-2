@@ -101,6 +101,35 @@ from .chunk_kda import (
 #         GDN-2-specific change relative to the gated delta rule.
 # Token-parallel: each program handles a block of tokens within one chunk.
 # =============================================================================
+_SR_STEP = [0]
+
+
+def _sr_next_seed() -> int:
+    _SR_STEP[0] = (_SR_STEP[0] + 1) & 0x7FFFFFFF
+    return _SR_STEP[0]
+
+
+@triton.jit
+def _store_sr_bf16(ptr_block, tile, seed, uid, USE_SR: tl.constexpr):
+    """Store an fp32 tile to a bf16 block pointer with stochastic rounding.
+
+    bf16 is the top 16 bits of fp32: adding uniform-random low-16 bits and
+    truncating is exact stochastic rounding for normal values. SR replaces
+    round-to-nearest's value-correlated bias (which compounds through the
+    optimizer over thousands of steps) with zero-mean noise.
+    """
+    if USE_SR:
+        vi = tile.to(tl.float32).to(tl.int32, bitcast=True)
+        offs = tl.arange(0, tile.shape[0])[:, None] * tile.shape[1] \
+             + tl.arange(0, tile.shape[1])[None, :]
+        rnd = (tl.rand(seed + uid, offs) * 65536.0).to(tl.int32)
+        vi = (vi + rnd) & -65536  # 0xFFFF0000 as int32
+        out = vi.to(tl.float32, bitcast=True)
+        tl.store(ptr_block, out.to(ptr_block.dtype.element_ty), boundary_check=(0, 1))
+    else:
+        tl.store(ptr_block, tile.to(ptr_block.dtype.element_ty), boundary_check=(0, 1))
+
+
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -328,8 +357,13 @@ def chunk_gdn2_fwd_kernel_intra_sub_chunk(
         b_gn = b_gn[None, :]
 
     b_gm = (b_g - b_gn).to(tl.float32)
-    b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.)
-    b_gk = tl.where(m_c[:, None], exp2(-b_gm), 0.)
+    # Overflow clamp at 2^110: keeps value*factor finite in bf16 for
+    # |value| up to ~32k (2^126 let |q|>4 legs overflow to inf, and
+    # inf*0 = NaN lands in causally-kept positions). Pairs whose factor
+    # binds have counterparts at/near underflow, so the kept-region math
+    # is unchanged; masked-region infs are where()'d to zero.
+    b_gq = tl.where(m_c[:, None], exp2(tl.minimum(b_gm, 110.0)), 0.)
+    b_gk = tl.where(m_c[:, None], exp2(tl.minimum(-b_gm, 110.0)), 0.)
 
     b_kgt = tl.trans(b_k * b_gk)
 
@@ -1030,6 +1064,8 @@ def chunk_gdn2_fwd(
     # it only pays when that grid can occupy the GPU; grid-starved
     # small-batch/long-context shapes keep the parallel two-kernel path.
     # GDN2_FUSE_O=1/0 forces; default is this occupancy heuristic.
+    # (Acquitted by the step-1000 NaN bisect — arm F NaN'd with fuse-O off;
+    # the culprit was bf16 grad stores, now opt-in via GDN2_GRAD_STORE_DTYPE.)
     _fuse_env = _os.environ.get("GDN2_FUSE_O", "auto")
     if _fuse_env == "auto":
         N_seqs = q.shape[0] if cu_seqlens is None else len(cu_seqlens) - 1
@@ -1309,10 +1345,12 @@ def chunk_gdn2_bwd_kernel_wy_dqkg_fused(
     cu_seqlens,
     chunk_indices,
     scale,
+    sr_seed,
     T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    USE_SR: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
@@ -1420,7 +1458,8 @@ def chunk_gdn2_bwd_kernel_wy_dqkg_fused(
                 b_dw_gate = b_dvb * b_v
 
                 tl.store(p_dv2, b_dv2.to(p_dv2.dtype.element_ty), boundary_check=(0, 1))
-                tl.store(p_dw_gate, b_dw_gate.to(p_dw_gate.dtype.element_ty), boundary_check=(0, 1))
+                _store_sr_bf16(p_dw_gate, b_dw_gate, sr_seed,
+                               (i_bh * tl.num_programs(0) + i_t) * 2 + i_v, USE_SR)
 
         b_gk_exp = exp2(b_g)
         b_gb = b_gk_exp * b_b
@@ -1495,8 +1534,7 @@ def chunk_gdn2_bwd_kernel_intra(
     dk2,
     dg,
     dg2,
-    db,
-    db_out,
+    db,                 
     cu_seqlens,
     chunk_indices,
     B,
@@ -1543,8 +1581,7 @@ def chunk_gdn2_bwd_kernel_intra(
     dk2 += (bos * H + i_h) * K
     dg += (bos * H + i_h) * K
     dg2 += (bos * H + i_h) * K
-    db += (bos * H + i_h) * K
-    db_out += (bos * H + i_h) * K
+    db += (i_k * all + bos) * H * BK + i_h * BK
 
     p_g = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
     b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
@@ -1589,7 +1626,7 @@ def chunk_gdn2_bwd_kernel_intra(
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_k = tl.load(p_k, boundary_check=(0, 1))
 
-    if True:  # anchored-dot diagonal (exact for any gates; ex-SAFE_GATE path)
+    if SAFE_GATE:
         if USE_GATHER:
             b_gn = gather(b_g, tl.full([1, BK], min(BC // 2, T - i_ti - 1), dtype=tl.int16), axis=0)
         else:
@@ -1613,6 +1650,23 @@ def chunk_gdn2_bwd_kernel_intra(
         b_k_exp_diag_qk = b_k * exp_neg_b_g_diag_qk
         b_dq2 += tl.dot(b_dAqk_diag_qk, b_k_exp_diag_qk) * exp_b_g_diag_qk
         b_dk2 += tl.dot(b_dAkk_diag_qk, b_k_exp_diag_qk) * exp_b_g_diag_qk
+    else:
+        for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
+            # [BC]
+            b_dAqk = tl.load(dAqk + o_dA + j, mask=m_dA, other=0)
+            b_dAkk = tl.load(dAkk + o_dA + j, mask=m_dA, other=0)
+            # [BK]
+            b_kj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32)
+            b_gkj = tl.load(p_gkj, mask=m_k, other=0).to(tl.float32)
+            # [BC, BK]
+            m_i = o_i[:, None] >= j
+            # [BC, BK]
+            b_gqk = exp2(b_g - b_gkj[None, :])
+            b_dq2 += tl.where(m_i, b_dAqk[:, None] * b_kj[None, :] * b_gqk, 0.)
+            b_dk2 += tl.where(m_i, b_dAkk[:, None] * b_kj[None, :] * b_gqk, 0.)
+
+            p_kj += H * K
+            p_gkj += H * K
 
 
     b_db_tile = b_dk2 * b_k
@@ -1620,17 +1674,12 @@ def chunk_gdn2_bwd_kernel_intra(
 
     p_dq = tl.make_block_ptr(dq, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
     p_dq2 = tl.make_block_ptr(dq2, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    # Fold the wy_dqkg db partial in here (each program owns a disjoint
-    # [BC, BK] region) and emit the final bf16 db directly: kills the
-    # separate 600MB add_ pass and the terminal cast.
-    p_db_in = tl.make_block_ptr(db, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    p_db_out = tl.make_block_ptr(db_out, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+    p_db = tl.make_block_ptr(db, (T, BK), (H * BK, 1), (i_ti, 0), (BC, BK), (1, 0))
 
     b_dg2 = b_q * b_dq2
     b_dq2 = b_dq2 + tl.load(p_dq, boundary_check=(0, 1))
     tl.store(p_dq2, b_dq2.to(p_dq2.dtype.element_ty), boundary_check=(0, 1))
-    b_db_tile += tl.load(p_db_in, boundary_check=(0, 1)).to(tl.float32)
-    tl.store(p_db_out, b_db_tile.to(p_db_out.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_db, b_db_tile.to(p_db.dtype.element_ty), boundary_check=(0, 1))
 
     tl.debug_barrier()
     b_dkt = tl.zeros([BC, BK], dtype=tl.float32)
@@ -1673,7 +1722,7 @@ def chunk_gdn2_bwd_kernel_intra(
     p_gkj = g + i_ti * H * K + o_k
     p_bj_ptr = b + i_ti * H * K + o_k
 
-    if True:  # anchored-dot transpose-diagonal (ex-SAFE_GATE path)
+    if SAFE_GATE:
         if USE_GATHER:
             b_gn = gather(b_g, tl.full([1, BK], min(BC // 2, T - i_ti - 1), dtype=tl.int16), axis=0)
         else:
@@ -1700,6 +1749,27 @@ def chunk_gdn2_bwd_kernel_intra(
 
         b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
         b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
+    else:
+        for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
+            # [BC,]
+            b_dAqk = tl.load(dAqk + o_dA + j * H * BT)
+            b_dAkk = tl.load(dAkk + o_dA + j * H * BT)
+            # [BK,]
+            b_qj = tl.load(p_qj, mask=m_k, other=0).to(tl.float32)
+            b_kj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32)
+            b_bj = tl.load(p_bj_ptr, mask=m_k, other=0).to(tl.float32)
+            b_kbj = b_kj * b_bj
+            b_gkj = tl.load(p_gkj, mask=m_k, other=0).to(tl.float32)
+            # [BC, BK]
+            m_i = o_i[:, None] <= j
+            b_gkq = exp2(b_gkj[None, :] - b_g)
+            b_dkt += tl.where(m_i, b_dAqk[:, None] * b_qj[None, :] * b_gkq, 0.)
+            b_dkt += tl.where(m_i, b_dAkk[:, None] * b_kbj[None, :] * b_gkq, 0.)
+
+            p_qj += H * K
+            p_kj += H * K
+            p_gkj += H * K
+            p_bj_ptr += H * K
 
     p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
     p_dk2 = tl.make_block_ptr(dk2, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
@@ -1760,7 +1830,17 @@ def chunk_gdn2_bwd_wy_dqkg_fused(
     db = torch.empty_like(b, dtype=torch.float32)
     # dw is terminal (no later accumulation): store bf16 directly and skip
     # the 150MB cast kernel in the autograd wrapper.
-    dw = torch.empty_like(wg)
+    # bf16 dw/db stores were CONVICTED (exhaustive 6-arm bisect) of a
+    # deterministic training NaN at step ~1000: the store rounding acts as a
+    # compounding gradient bias. fp32 accumulation with a single cast at the
+    # autograd boundary is upstream-exact and is the default; bf16 is opt-in
+    # and requires a >=2k-step loss A/B (it moved the NaN onset, so it is a
+    # dynamics-relevant perturbation, not free bandwidth).
+    import os as _os
+
+    _gsd = _os.environ.get("GDN2_GRAD_STORE_DTYPE", "fp32")
+    _gs_dtype = wg.dtype if _gsd in ("bf16", "bf16sr") else torch.float32
+    dw = torch.empty_like(wg, dtype=_gs_dtype)
     dA = torch.empty_like(A, dtype=torch.float32)
 
     grid = (NT, B * H)
@@ -1787,14 +1867,19 @@ def chunk_gdn2_bwd_wy_dqkg_fused(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
+        sr_seed=_sr_next_seed(),
         T=T,
         H=H,
         K=K,
         V=V,
+        USE_SR=(dw.dtype != torch.float32
+                and _os.environ.get("GDN2_GRAD_STORE_DTYPE", "fp32") == "bf16sr"),
         BT=BT,
         TRANSPOSE_STATE=transpose_state_layout,
     )
     dv = dv2
+    if dw.dtype != wg.dtype:
+        dw = dw.to(wg.dtype)
     return dq, dk, dv, db, dw, dg, dA
 
 
@@ -1829,7 +1914,7 @@ def chunk_gdn2_bwd_intra(
     dq2 = torch.empty_like(q)
     dk2 = torch.empty_like(k)
 
-    db_out = torch.empty_like(b)
+    db2 = q.new_empty(NK, B, T, H, BK, dtype=torch.float32)
     dg2 = torch.empty_like(dg, dtype=torch.float32)
     grid = (NK * NC, NT, B * H)
     chunk_gdn2_bwd_kernel_intra[grid](
@@ -1845,8 +1930,7 @@ def chunk_gdn2_bwd_intra(
         dk2=dk2,
         dg=dg,
         dg2=dg2,
-        db=db,
-        db_out=db_out,
+        db=db2,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         B=B,
@@ -1862,7 +1946,8 @@ def chunk_gdn2_bwd_intra(
     )
     dq = dq2
     dk = dk2
-    db = db_out
+    db2_combined = db2.permute(1, 2, 3, 0, 4).contiguous().reshape(B, T, H, NK * BK)[..., :K]
+    db = db.add_(db2_combined)
     dg = dg2
     return dq, dk, db, dg
 
