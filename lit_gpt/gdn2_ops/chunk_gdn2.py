@@ -859,6 +859,41 @@ def chunk_gdn2_fwd_intra(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
+    # Fused CUDA path (GDN2_FWD_IMPL=cuda): scores + triangular solve + WY
+    # auxiliaries in one kernel — no Akkd buffer, no Akk zero-init, no
+    # separate w_u launch. Uses fp32 FMA where the Triton pipeline uses
+    # tf32/bf16 dots (strictly closer to the fp64 reference; same accepted
+    # class as the merged backward kernel). Falls back to the Triton
+    # pipeline for exact-intra mode, safe_gate, varlen, or K/V != 128.
+    import os as _os
+    if (_os.environ.get("GDN2_FWD_IMPL", "triton").lower() == "cuda_fused"
+            and _os.environ.get("GDN2_EXACT_INTRA", "0") != "1"
+            and not safe_gate and cu_seqlens is None
+            and BT == 64 and K == 128 and v.shape[-1] == 128
+            and q.is_cuda and torch.cuda.get_device_capability(q.device) == (12, 0)
+            and all(t.dtype == torch.bfloat16 and t.is_contiguous()
+                    for t in (q, k, v, b, wg))
+            and gk.dtype == torch.float32 and gk.is_contiguous()):
+        ext = _load_wy_cuda_ext()
+        if ext is not None and hasattr(ext, "gdn2_fwd_intra_fused"):
+            Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+            Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+            w = torch.empty_like(k)
+            u = torch.empty_like(v)
+            kg = torch.empty_like(k)
+            qg = torch.empty_like(q) if disable_recompute else None
+            try:
+                ext.gdn2_fwd_intra_fused(q, k, v, gk, b, wg, Aqk, Akk, w, u,
+                                         kg, qg, float(scale))
+                return w, u, qg, kg, Aqk, Akk
+            except Exception as exc:
+                global _wy_cuda_ext
+                _wy_cuda_ext = False
+                warnings.warn(
+                    f"GDN2_FWD_IMPL=cuda: fused fwd kernel failed ({exc}); "
+                    "falling back to the Triton pipeline permanently."
+                )
+
     Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
     # Akk must be zero-initialized - kernel only writes lower triangular.
     Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
@@ -970,6 +1005,33 @@ def recompute_w_u_fwd_gdn2(
     u = torch.empty_like(v)
     qg = torch.empty_like(q) if q is not None else None
     kg = torch.empty_like(k) if gk is not None else None
+
+    # CUDA WY-auxiliary kernel (GDN2_FWD_IMPL=cuda or cuda_fused): same bf16
+    # operand roundings and tensor-core dots as the Triton kernel, one CTA
+    # per (chunk, head). Serves both the forward step-3 and the backward
+    # recompute. Falls back to Triton for unsupported configurations.
+    if (os.environ.get("GDN2_FWD_IMPL", "triton").lower()
+            in ("cuda", "cuda_fused")
+            and cu_seqlens is None and BT == 64 and K == 128 and V == 128
+            and gk is not None and gk.dtype == torch.float32
+            and gk.is_contiguous()
+            and k.is_cuda and torch.cuda.get_device_capability(k.device) == (12, 0)
+            and all(t.dtype == torch.bfloat16 and t.is_contiguous()
+                    for t in (k, v, b, wg, A))
+            and (q is None or (q.dtype == torch.bfloat16 and q.is_contiguous()))):
+        ext = _load_wy_cuda_ext()
+        if ext is not None and hasattr(ext, "gdn2_w_u_fused"):
+            try:
+                ext.gdn2_w_u_fused(q, k, v, gk, b, wg, A, w, u, kg, qg)
+                return w, u, qg, kg
+            except Exception as exc:
+                global _wy_cuda_ext
+                _wy_cuda_ext = False
+                warnings.warn(
+                    f"GDN2_FWD_IMPL=cuda: w_u kernel failed ({exc}); "
+                    "falling back to the Triton kernel permanently."
+                )
+
     recompute_w_u_fwd_gdn2_kernel[(NT, B * H)](
         q=q,
         k=k,

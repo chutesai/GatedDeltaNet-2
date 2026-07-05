@@ -1371,6 +1371,626 @@ gdn2_wy_intra_bwd_kernel(
   }
 }
 
+// ============================================================================
+// Fused forward intra kernel: sub-chunk scores + triangular solve + WY
+// auxiliaries in one pass (replaces chunk_gdn2_fwd_kernel_intra_sub_chunk,
+// chunk_gdn2_fwd_kernel_inter_solve_fused and recompute_w_u_fwd_gdn2_kernel,
+// plus the Akkd round-trip and the Akk zeros-init).
+//
+//   F1  scores: 6 warps own the six lower off-diagonal (i,j) block pairs
+//       (first-row-of-block anchor; all factors <= 1, no clamp — matches
+//       Triton), 2 warps own the four diagonal blocks (mid-anchor with the
+//       2^110 overflow clamp) plus the 16x16 unit-lower-triangular inverses
+//       by forward substitution (16 lanes per block, inverse columns held
+//       in registers, rows broadcast by shuffle).
+//   F2  block assembly of (I+T)^{-1}: level 1 Ai10/Ai21/Ai32, level 2
+//       Ai20/Ai31, level 3 Ai30 — fp32 FMA (upstream uses tf32 here; fp32
+//       is strictly closer to the fp64 reference, same accepted class as
+//       the merged backward kernel).
+//   F3  w = A @ (b*exp2(g)*k), u = A @ (wg*v), kg = k*exp2(g_last - g),
+//       optional qg = q*exp2(g), and the bf16 store of A (upper zeros).
+//
+// g stays in gmem (__ldg; the Triton pipeline re-reads it per kernel too).
+// ============================================================================
+
+struct FwdShared {
+  bf16 k_t[kBT * kD];      // 16KB  k tile (all phases)
+  bf16 qv_t[kBT * kD];     // 16KB  q (F1) | v*wg (F3)
+  bf16 b_t[kBT * kD];      // 16KB  b tile (F1) | kb*2^g (F3)
+  float Afull[kBT * kBT];  // 16KB  assembled (I+T)^{-1}
+  float Traw[kBT * kBT];   // 16KB  raw off-diag T blocks (F1/F2) | wg bf16 (F3)
+  bf16 Abf[kBT * kBT];     //  8KB  bf16 A for the F3 tensor-core dots
+};
+
+__global__ void __launch_bounds__(kWarps * 32, 1)
+gdn2_fwd_intra_fused_kernel(
+    const bf16* __restrict__ q,
+    const bf16* __restrict__ k,
+    const bf16* __restrict__ v,
+    const float* __restrict__ g,
+    const bf16* __restrict__ b,
+    const bf16* __restrict__ wg,
+    bf16* __restrict__ Aqk_o,
+    bf16* __restrict__ Akk_o,
+    bf16* __restrict__ w_o,
+    bf16* __restrict__ u_o,
+    bf16* __restrict__ kg_o,
+    bf16* __restrict__ qg_o,   // nullable
+    int T, int H, float scale) {
+  extern __shared__ char smem_raw[];
+  FwdShared& sm = *reinterpret_cast<FwdShared*>(smem_raw);
+
+  const int i_t = blockIdx.x;
+  const int i_bh = blockIdx.y;
+  const int i_b = i_bh / H, i_h = i_bh % H;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const long bos = (long)i_b * T;
+  const int t_lo = i_t * kBT;
+  const int rows_here = min(kBT, T - t_lo);
+  if (rows_here <= 0) return;
+
+  auto rowp = [&](const bf16* base, int t, int d) -> const bf16* {
+    return base + ((bos + t_lo + t) * H + i_h) * (long)kD + d;
+  };
+  const long hk = (long)H * kD;
+  const long g0 = ((bos + t_lo) * H + i_h) * (long)kD;
+  auto g_at = [&](int t, int c) -> float {
+    return __ldg(g + g0 + (long)t * hk + c);
+  };
+
+  // ---- stage k, q, b; zero Traw and Afull ----
+  for (int idx = threadIdx.x; idx < kBT * (kD / 8); idx += kWarps * 32) {
+    const int r = idx >> 4, c8 = (idx & 15) << 3;
+    const bool ok = r < rows_here;
+    cp_async_16(smem_u32(&sm.k_t[sw_off(r, c8)]), rowp(k, r, c8), ok);
+    cp_async_16(smem_u32(&sm.qv_t[sw_off(r, c8)]), rowp(q, r, c8), ok);
+    cp_async_16(smem_u32(&sm.b_t[sw_off(r, c8)]), rowp(b, r, c8), ok);
+  }
+  cp_async_commit();
+  for (int idx = threadIdx.x; idx < kBT * kBT; idx += kWarps * 32) {
+    sm.Traw[idx] = 0.f;
+    sm.Afull[idx] = 0.f;
+  }
+  cp_async_wait<0>();
+  __syncthreads();
+
+  // ================================ F1 ================================
+  if (warp < 6) {
+    // off-diagonal pair: (i, j), i > j
+    const int OD_I[6] = {1, 2, 2, 3, 3, 3};
+    const int OD_J[6] = {0, 0, 1, 0, 1, 2};
+    const int bi = OD_I[warp], bj = OD_J[warp];
+    if (bi * 16 < rows_here) {
+      const int ri = min(16, rows_here - bi * 16);
+      const int t = lane >> 1;              // row within block i
+      const int j0 = bj * 16 + (lane & 1) * 8;  // first of 8 owned cols
+      const int trow = bi * 16 + t;
+      float acc_qk[8], acc_kk[8];
+      #pragma unroll
+      for (int e = 0; e < 8; ++e) { acc_qk[e] = acc_kk[e] = 0.f; }
+      const bool tv = t < ri;
+      const float* ganc = g + g0 + (long)(bi * 16) * hk;   // first-row anchor
+      const float* gown = g + g0 + (long)trow * hk;
+      for (int c8 = 0; c8 < kD; c8 += 8) {
+        float gn8[8], qe8[8], bke8[8];
+        {
+          const float4 a0 = __ldg(reinterpret_cast<const float4*>(ganc + c8));
+          const float4 a1 = __ldg(reinterpret_cast<const float4*>(ganc + c8 + 4));
+          gn8[0] = a0.x; gn8[1] = a0.y; gn8[2] = a0.z; gn8[3] = a0.w;
+          gn8[4] = a1.x; gn8[5] = a1.y; gn8[6] = a1.z; gn8[7] = a1.w;
+        }
+        {
+          float gt8[8];
+          if (tv) {
+            const float4 t0 = __ldg(reinterpret_cast<const float4*>(gown + c8));
+            const float4 t1 = __ldg(reinterpret_cast<const float4*>(gown + c8 + 4));
+            gt8[0] = t0.x; gt8[1] = t0.y; gt8[2] = t0.z; gt8[3] = t0.w;
+            gt8[4] = t1.x; gt8[5] = t1.y; gt8[6] = t1.z; gt8[7] = t1.w;
+          } else {
+            #pragma unroll
+            for (int cc = 0; cc < 8; ++cc) gt8[cc] = 0.f;
+          }
+          uint4 qraw = *reinterpret_cast<const uint4*>(&sm.qv_t[sw_off(trow, c8)]);
+          uint4 braw = *reinterpret_cast<const uint4*>(&sm.b_t[sw_off(trow, c8)]);
+          uint4 kraw = *reinterpret_cast<const uint4*>(&sm.k_t[sw_off(trow, c8)]);
+          const bf16* qv8 = reinterpret_cast<const bf16*>(&qraw);
+          const bf16* bv8 = reinterpret_cast<const bf16*>(&braw);
+          const bf16* kv8 = reinterpret_cast<const bf16*>(&kraw);
+          #pragma unroll
+          for (int cc = 0; cc < 8; ++cc) {
+            const float ef = tv ? exp2f(gt8[cc] - gn8[cc]) : 0.f;   // <= 1
+            qe8[cc] = __bfloat162float(qv8[cc]) * ef;
+            bke8[cc] = __bfloat162float(bv8[cc])
+                       * __bfloat162float(kv8[cc]) * ef;
+          }
+        }
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int jrow = j0 + e;
+          const float* gj = g + g0 + (long)jrow * hk;
+          const float4 j0f = __ldg(reinterpret_cast<const float4*>(gj + c8));
+          const float4 j1f = __ldg(reinterpret_cast<const float4*>(gj + c8 + 4));
+          float gj8[8];
+          gj8[0] = j0f.x; gj8[1] = j0f.y; gj8[2] = j0f.z; gj8[3] = j0f.w;
+          gj8[4] = j1f.x; gj8[5] = j1f.y; gj8[6] = j1f.z; gj8[7] = j1f.w;
+          uint4 kjraw = *reinterpret_cast<const uint4*>(&sm.k_t[sw_off(jrow, c8)]);
+          const bf16* kj8 = reinterpret_cast<const bf16*>(&kjraw);
+          #pragma unroll
+          for (int cc = 0; cc < 8; ++cc) {
+            const float f = __bfloat162float(kj8[cc])
+                            * exp2f(gn8[cc] - gj8[cc]);   // <= 1
+            acc_qk[e] += qe8[cc] * f;
+            acc_kk[e] += bke8[cc] * f;
+          }
+        }
+      }
+      if (tv) {
+        const long orow = ((bos + t_lo + trow) * H + i_h) * (long)kBT;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          Aqk_o[orow + j0 + e] = __float2bfloat16(acc_qk[e] * scale);
+          sm.Traw[trow * kBT + j0 + e] = acc_kk[e];
+        }
+      }
+    }
+  } else {
+    // diagonal blocks: warp 6 -> blocks 0,1 ; warp 7 -> blocks 2,3.
+    // Half-warp per block; lane-in-half n owns COLUMN n.
+    const int d = (warp - 6) * 2 + (lane >> 4);
+    const int n = lane & 15;
+    const unsigned hmask = (lane < 16) ? 0x0000ffffu : 0xffff0000u;
+    float Tcol[16], Aqkcol[16];
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) { Tcol[m] = Aqkcol[m] = 0.f; }
+    const int rd = min(16, rows_here - d * 16);   // valid rows (may be <=0)
+    if (rd > 0) {
+      const int anchor = d * 16 + min(8, rows_here - d * 16 - 1);
+      const int ncol = d * 16 + n;                 // absolute column row-index
+      const bool nv = n < rd;
+      for (int c = 0; c < kD; ++c) {
+        const float gn = g_at(anchor, c);
+        // own row's left-operand pieces (lane n also acts as row n)
+        const float gr = nv ? g_at(ncol, c) : 0.f;
+        const float e_own = nv ? exp2f(fminf(gr - gn, 110.f)) : 0.f;
+        const float q_own = __bfloat162float(sm.qv_t[sw_off(ncol, c)]) * e_own;
+        const float bk_own = __bfloat162float(sm.b_t[sw_off(ncol, c)])
+                             * __bfloat162float(sm.k_t[sw_off(ncol, c)]) * e_own;
+        const float f_own = nv
+            ? __bfloat162float(sm.k_t[sw_off(ncol, c)])
+              * exp2f(fminf(gn - gr, 110.f))
+            : 0.f;
+        #pragma unroll
+        for (int m = 0; m < 16; ++m) {
+          const float qm = __shfl_sync(hmask, q_own, m, 16);
+          const float bkm = __shfl_sync(hmask, bk_own, m, 16);
+          Aqkcol[m] += qm * f_own;
+          Tcol[m] += bkm * f_own;
+        }
+      }
+      // store the FULL Aqk diagonal block for valid rows, with explicit
+      // zeros above the (inclusive) diagonal — downstream dots rely on the
+      // zeros, exactly like the Triton sub-chunk kernel's masked store.
+      #pragma unroll
+      for (int m = 0; m < 16; ++m) {
+        if (m < rd) {
+          Aqk_o[((bos + t_lo + d * 16 + m) * H + i_h) * (long)kBT + d * 16 + n] =
+              __float2bfloat16((m >= n) ? Aqkcol[m] * scale : 0.f);
+        }
+      }
+      // T strict lower for the inversion
+      #pragma unroll
+      for (int m = 0; m < 16; ++m)
+        if (m <= n || m >= rd) Tcol[m] = 0.f;
+    }
+    // forward substitution: Ai = (I + T)^{-1}, unit lower triangular.
+    float Aicol[16];
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) Aicol[m] = -Tcol[m];
+    const int bound = max(rd, 0);
+    #pragma unroll
+    for (int i = 2; i < 16; ++i) {
+      // row i of the running inverse: a_n = -T[i, n] (n < i), then
+      // a += a @ Ai (rows < i), done column-wise per lane.
+      float a_n = (n < i) ? -Tcol[i] : 0.f;
+      float upd = 0.f;
+      #pragma unroll
+      for (int m = 0; m < 16; ++m) {
+        const float am = __shfl_sync(hmask, a_n, m, 16);
+        if (m < i) upd += am * Aicol[m];
+      }
+      if (i < bound) Aicol[i] = a_n + upd;
+    }
+    // add identity and write the block column into Afull
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) {
+      float val = Aicol[m] + ((m == n) ? 1.f : 0.f);
+      sm.Afull[(d * 16 + m) * kBT + d * 16 + n] = val;
+    }
+  }
+  __syncthreads();
+
+  // ================================ F2 ================================
+  // Afull[i,j] = -Ai_ii @ Traw[i,j] @ Ai_jj (level 1), then the two-term and
+  // three-term rows. 16 lanes per product, lane = output column.
+  {
+    const int n = lane & 15;
+    float x[16], y[16];
+    // ---- level 1: Ai10, Ai21, Ai32 (warps 0,1,2; lanes 0-15) ----
+    if (lane < 16 && warp < 3) {
+      const int i = warp + 1, j = warp;   // (1,0), (2,1), (3,2)
+      // X = Ai_ii @ T[i,j]   (x[m] = column n of X)
+      #pragma unroll
+      for (int m = 0; m < 16; ++m) {
+        float s = 0.f;
+        #pragma unroll
+        for (int p = 0; p < 16; ++p)
+          s += sm.Afull[(i * 16 + m) * kBT + i * 16 + p]
+               * sm.Traw[(i * 16 + p) * kBT + j * 16 + n];
+        x[m] = s;
+      }
+      // Y = -X @ Ai_jj (row m of X is spread across lanes -> shuffle)
+      #pragma unroll
+      for (int m = 0; m < 16; ++m) {
+        float s = 0.f;
+        #pragma unroll
+        for (int p = 0; p < 16; ++p) {
+          const float xmp = __shfl_sync(0x0000ffffu, x[m], p, 16);
+          s += xmp * sm.Afull[(j * 16 + p) * kBT + j * 16 + n];
+        }
+        y[m] = -s;
+      }
+      #pragma unroll
+      for (int m = 0; m < 16; ++m)
+        sm.Afull[(i * 16 + m) * kBT + j * 16 + n] = y[m];
+    }
+  }
+  __syncthreads();
+  {
+    const int n = lane & 15;
+    // ---- level 2: Ai20 = -Ai22 @ (T20 @ Ai00 + T21 @ Ai10)
+    //               Ai31 = -Ai33 @ (T31 @ Ai11 + T32 @ Ai21)  (warps 0,1) ----
+    if (lane < 16 && warp < 2) {
+      const int i = warp + 2;             // 2 or 3
+      const int j = warp;                 // 0 or 1
+      float s_col[16];
+      #pragma unroll
+      for (int m = 0; m < 16; ++m) {
+        float s = 0.f;
+        #pragma unroll
+        for (int p = 0; p < 16; ++p) {
+          // (T[i,j] @ Ai[j,j])[m,n] + (T[i,j+1] @ Ai[j+1,j])[m,n]
+          s += sm.Traw[(i * 16 + m) * kBT + j * 16 + p]
+               * sm.Afull[(j * 16 + p) * kBT + j * 16 + n];
+          s += sm.Traw[(i * 16 + m) * kBT + (j + 1) * 16 + p]
+               * sm.Afull[((j + 1) * 16 + p) * kBT + j * 16 + n];
+        }
+        s_col[m] = s;
+      }
+      float y[16];
+      #pragma unroll
+      for (int m = 0; m < 16; ++m) {
+        float s = 0.f;
+        #pragma unroll
+        for (int p = 0; p < 16; ++p) {
+          const float smp = __shfl_sync(0x0000ffffu, s_col[m], p, 16);
+          s += sm.Afull[(i * 16 + m) * kBT + i * 16 + p] * smp;
+        }
+        y[m] = -s;
+      }
+      #pragma unroll
+      for (int m = 0; m < 16; ++m)
+        sm.Afull[(i * 16 + m) * kBT + j * 16 + n] = y[m];
+    }
+  }
+  __syncthreads();
+  {
+    const int n = lane & 15;
+    // ---- level 3: Ai30 = -Ai33 @ (T30 @ Ai00 + T31 @ Ai10 + T32 @ Ai20) ----
+    if (lane < 16 && warp == 0) {
+      float s_col[16];
+      #pragma unroll
+      for (int m = 0; m < 16; ++m) {
+        float s = 0.f;
+        #pragma unroll
+        for (int p = 0; p < 16; ++p) {
+          s += sm.Traw[(48 + m) * kBT + p] * sm.Afull[p * kBT + n];
+          s += sm.Traw[(48 + m) * kBT + 16 + p] * sm.Afull[(16 + p) * kBT + n];
+          s += sm.Traw[(48 + m) * kBT + 32 + p] * sm.Afull[(32 + p) * kBT + n];
+        }
+        s_col[m] = s;
+      }
+      float y[16];
+      #pragma unroll
+      for (int m = 0; m < 16; ++m) {
+        float s = 0.f;
+        #pragma unroll
+        for (int p = 0; p < 16; ++p) {
+          const float smp = __shfl_sync(0x0000ffffu, s_col[m], p, 16);
+          s += sm.Afull[(48 + m) * kBT + 48 + p] * smp;
+        }
+        y[m] = -s;
+      }
+      #pragma unroll
+      for (int m = 0; m < 16; ++m)
+        sm.Afull[(48 + m) * kBT + n] = y[m];
+    }
+  }
+  __syncthreads();
+
+  // ================================ F3 ================================
+  // Store Akk bf16 (upper blocks zero) while building the bf16 A tile, turn
+  // b_t into kb*2^g and qv_t into v*wg (both bf16-rounded exactly like the
+  // Triton w_u kernel), then w/u on tensor cores.
+  {
+    bf16* wg_s = reinterpret_cast<bf16*>(sm.Traw);
+    for (int idx = threadIdx.x; idx < kBT * (kD / 8); idx += kWarps * 32) {
+      const int r = idx >> 4, c8 = (idx & 15) << 3;
+      const bool ok = r < rows_here;
+      cp_async_16(smem_u32(&sm.qv_t[sw_off(r, c8)]), rowp(v, r, c8), ok);
+      cp_async_16(smem_u32(&wg_s[sw_off(r, c8)]), rowp(wg, r, c8), ok);
+    }
+    cp_async_commit();
+
+    for (int idx = threadIdx.x; idx < kBT * kBT; idx += kWarps * 32) {
+      const int r = idx / kBT, c = idx % kBT;
+      const bool lower = (c >> 4) <= (r >> 4);
+      const float av = lower ? sm.Afull[idx] : 0.f;
+      const bf16 ab = __float2bfloat16(av);
+      sm.Abf[sw_off64(r, c)] = (r < rows_here) ? ab : __float2bfloat16(0.f);
+      if (r < rows_here)
+        Akk_o[((bos + t_lo + r) * H + i_h) * (long)kBT + c] = ab;
+    }
+
+    // kg = k * exp2(g_last - g) (masked rows), from k smem + g gmem.
+    const int lastr = rows_here - 1;
+    for (int idx = threadIdx.x; idx < kBT * kD; idx += kWarps * 32) {
+      const int r = idx >> 7, c = idx & 127;
+      if (r >= rows_here) continue;
+      const float kk = __bfloat162float(sm.k_t[sw_off(r, c)]);
+      const float e = exp2f(g_at(lastr, c) - g_at(r, c));
+      kg_o[((bos + t_lo + r) * H + i_h) * (long)kD + c] =
+          __float2bfloat16(kk * e);
+    }
+    // qg = q * exp2(g) (optional; q re-read from gmem — qv_t now holds v).
+    if (qg_o != nullptr) {
+      for (int idx = threadIdx.x; idx < kBT * kD; idx += kWarps * 32) {
+        const int r = idx >> 7, c = idx & 127;
+        if (r >= rows_here) continue;
+        const float qq = __bfloat162float(__ldg(rowp(q, r, c)));
+        qg_o[((bos + t_lo + r) * H + i_h) * (long)kD + c] =
+            __float2bfloat16(qq * exp2f(g_at(r, c)));
+      }
+    }
+    // b_t := bf16(k * b * 2^g)  (b_t is dead as raw b after F1).
+    for (int idx = threadIdx.x; idx < kBT * kD; idx += kWarps * 32) {
+      const int r = idx >> 7, c = idx & 127;
+      const int sw = sw_off(r, c);
+      float kbe = 0.f;
+      if (r < rows_here) {
+        kbe = __bfloat162float(sm.k_t[sw]) * __bfloat162float(sm.b_t[sw])
+              * exp2f(g_at(r, c));
+      }
+      sm.b_t[sw] = __float2bfloat16(kbe);
+    }
+    cp_async_wait<0>();
+    __syncthreads();
+    // qv_t := bf16(v * wg) in place (each element owned by one thread).
+    for (int idx = threadIdx.x; idx < kBT * kD; idx += kWarps * 32) {
+      const int r = idx >> 7, c = idx & 127;
+      const int sw = sw_off(r, c);
+      float vw = 0.f;
+      if (r < rows_here) {
+        vw = __bfloat162float(sm.qv_t[sw]) * __bfloat162float(wg_s[sw]);
+      }
+      sm.qv_t[sw] = __float2bfloat16(vw);
+    }
+    __syncthreads();
+
+    // w = A @ kb_e, u = A @ vwg on tensor cores: warp (s, hf) owns
+    // [16 rows x 64 cols], contraction over the 64 chunk rows.
+    const int s = warp & 3, hf = warp >> 2;
+    float w_fr[32], u_fr[32];
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) { w_fr[i] = u_fr[i] = 0.f; }
+    #pragma unroll
+    for (int kc = 0; kc < kBT / 16; ++kc) {
+      unsigned a_A[4];
+      const int rr = s * 16 + (lane & 15);
+      const int cc = kc * 16 + ((lane & 16) ? 8 : 0);
+      ldmatrix_x4(a_A, smem_u32(&sm.Abf[sw_off64(rr, cc)]));
+      #pragma unroll
+      for (int n = 0; n < 8; ++n) {
+        const int col = hf * 64 + n * 8;
+        const int lrow = kc * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
+        unsigned bw[2], bu[2];
+        ldmatrix_x2_trans(bw, smem_u32(&sm.b_t[sw_off(lrow, col)]));
+        ldmatrix_x2_trans(bu, smem_u32(&sm.qv_t[sw_off(lrow, col)]));
+        mma_16x8x16(a_A, bw, &w_fr[n * 4]);
+        mma_16x8x16(a_A, bu, &u_fr[n * 4]);
+      }
+    }
+    #pragma unroll
+    for (int n = 0; n < 8; ++n)
+      #pragma unroll
+      for (int rr2 = 0; rr2 < 2; ++rr2)
+        #pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int i = n * 4 + rr2 * 2 + e;
+          const int trow = s * 16 + (lane >> 2) + rr2 * 8;
+          const int gc = hf * 64 + n * 8 + (lane & 3) * 2 + e;
+          if (trow < rows_here) {
+            const long off = ((bos + t_lo + trow) * H + i_h) * (long)kD + gc;
+            w_o[off] = __float2bfloat16(w_fr[i]);
+            u_o[off] = __float2bfloat16(u_fr[i]);
+          }
+        }
+  }
+}
+
+// ============================================================================
+// Standalone WY-auxiliary kernel (the backward-recompute counterpart of the
+// fused forward's F3): given the SAVED solved A, produce w = A @ (b*2^g*k),
+// u = A @ (wg*v), kg = k*2^(g_last-g), optional qg = q*2^g. Same bf16
+// operand roundings and tensor-core dots as recompute_w_u_fwd_gdn2_kernel.
+// ============================================================================
+
+// 40KB total -> 2 CTAs/SM (16 warps): the transforms are fused into the
+// load path so no raw operand tiles are ever staged.
+struct WuShared {
+  bf16 kbe_t[kBT * kD];  // 16KB k*b*2^g
+  bf16 vwg_t[kBT * kD];  // 16KB v*wg
+  bf16 Abf[kBT * kBT];   //  8KB A
+};
+
+__global__ void __launch_bounds__(kWarps * 32, 2)
+gdn2_w_u_fused_kernel(
+    const bf16* __restrict__ q,    // nullable (with qg_o)
+    const bf16* __restrict__ k,
+    const bf16* __restrict__ v,
+    const float* __restrict__ g,
+    const bf16* __restrict__ b,
+    const bf16* __restrict__ wg,
+    const bf16* __restrict__ A,
+    bf16* __restrict__ w_o,
+    bf16* __restrict__ u_o,
+    bf16* __restrict__ kg_o,
+    bf16* __restrict__ qg_o,       // nullable
+    int T, int H) {
+  extern __shared__ char smem_raw[];
+  WuShared& sm = *reinterpret_cast<WuShared*>(smem_raw);
+
+  const int i_t = blockIdx.x;
+  const int i_bh = blockIdx.y;
+  const int i_b = i_bh / H, i_h = i_bh % H;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const long bos = (long)i_b * T;
+  const int t_lo = i_t * kBT;
+  const int rows_here = min(kBT, T - t_lo);
+  if (rows_here <= 0) return;
+
+  auto rowp = [&](const bf16* base, int t, int d) -> const bf16* {
+    return base + ((bos + t_lo + t) * H + i_h) * (long)kD + d;
+  };
+  const long hk = (long)H * kD;
+  const long g0 = ((bos + t_lo) * H + i_h) * (long)kD;
+  auto g_at = [&](int t, int c) -> float {
+    return __ldg(g + g0 + (long)t * hk + c);
+  };
+
+  for (int idx = threadIdx.x; idx < kBT * (kBT / 8); idx += kWarps * 32) {
+    const int r = idx >> 3, c8 = (idx & 7) << 3;
+    const bool ok = r < rows_here;
+    const bf16* src = A + ((bos + t_lo + (ok ? r : 0)) * H + i_h) * (long)kBT + c8;
+    cp_async_16(smem_u32(&sm.Abf[sw_off64(r, c8)]), src, ok);
+  }
+  cp_async_commit();
+
+  // Fused load+transform pass: gmem k/b/v/wg (+q) -> smem kb*2^g and v*wg,
+  // gmem kg (and qg). No raw operand tiles are staged.
+  const int lastr = rows_here - 1;
+  const long glast = g0 + (long)lastr * hk;
+  for (int idx = threadIdx.x; idx < kBT * (kD / 8); idx += kWarps * 32) {
+    const int r = idx >> 4, c8 = (idx & 15) << 3;
+    bf16 kbe8[8], vwg8[8];
+    if (r < rows_here) {
+      const long grow = g0 + (long)r * hk;
+      const uint4 kk8 = *reinterpret_cast<const uint4*>(rowp(k, r, c8));
+      const uint4 bb8 = *reinterpret_cast<const uint4*>(rowp(b, r, c8));
+      const uint4 vv8 = *reinterpret_cast<const uint4*>(rowp(v, r, c8));
+      const uint4 ww8 = *reinterpret_cast<const uint4*>(rowp(wg, r, c8));
+      const bf16* kp = reinterpret_cast<const bf16*>(&kk8);
+      const bf16* bp = reinterpret_cast<const bf16*>(&bb8);
+      const bf16* vp = reinterpret_cast<const bf16*>(&vv8);
+      const bf16* wp = reinterpret_cast<const bf16*>(&ww8);
+      float gr[8], gl[8];
+      {
+        const float4 a0 = __ldg(reinterpret_cast<const float4*>(g + grow + c8));
+        const float4 a1 = __ldg(reinterpret_cast<const float4*>(g + grow + c8 + 4));
+        gr[0] = a0.x; gr[1] = a0.y; gr[2] = a0.z; gr[3] = a0.w;
+        gr[4] = a1.x; gr[5] = a1.y; gr[6] = a1.z; gr[7] = a1.w;
+        const float4 l0 = __ldg(reinterpret_cast<const float4*>(g + glast + c8));
+        const float4 l1 = __ldg(reinterpret_cast<const float4*>(g + glast + c8 + 4));
+        gl[0] = l0.x; gl[1] = l0.y; gl[2] = l0.z; gl[3] = l0.w;
+        gl[4] = l1.x; gl[5] = l1.y; gl[6] = l1.z; gl[7] = l1.w;
+      }
+      bf16 kg8[8];
+      #pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float kk = __bfloat162float(kp[e]);
+        kbe8[e] = __float2bfloat16(kk * __bfloat162float(bp[e]) * exp2f(gr[e]));
+        vwg8[e] = __float2bfloat16(__bfloat162float(vp[e])
+                                   * __bfloat162float(wp[e]));
+        kg8[e] = __float2bfloat16(kk * exp2f(gl[e] - gr[e]));
+      }
+      *reinterpret_cast<uint4*>(
+          &kg_o[((bos + t_lo + r) * H + i_h) * (long)kD + c8]) =
+          *reinterpret_cast<uint4*>(kg8);
+      if (qg_o != nullptr) {
+        const uint4 qq8 = *reinterpret_cast<const uint4*>(rowp(q, r, c8));
+        const bf16* qp = reinterpret_cast<const bf16*>(&qq8);
+        bf16 qg8[8];
+        #pragma unroll
+        for (int e = 0; e < 8; ++e)
+          qg8[e] = __float2bfloat16(__bfloat162float(qp[e]) * exp2f(gr[e]));
+        *reinterpret_cast<uint4*>(
+            &qg_o[((bos + t_lo + r) * H + i_h) * (long)kD + c8]) =
+            *reinterpret_cast<uint4*>(qg8);
+      }
+    } else {
+      #pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        kbe8[e] = __float2bfloat16(0.f);
+        vwg8[e] = __float2bfloat16(0.f);
+      }
+    }
+    *reinterpret_cast<uint4*>(&sm.kbe_t[sw_off(r, c8)]) =
+        *reinterpret_cast<uint4*>(kbe8);
+    *reinterpret_cast<uint4*>(&sm.vwg_t[sw_off(r, c8)]) =
+        *reinterpret_cast<uint4*>(vwg8);
+  }
+  cp_async_wait<0>();
+  __syncthreads();
+
+  const int s = warp & 3, hf = warp >> 2;
+  float w_fr[32], u_fr[32];
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) { w_fr[i] = u_fr[i] = 0.f; }
+  #pragma unroll
+  for (int kc = 0; kc < kBT / 16; ++kc) {
+    unsigned a_A[4];
+    const int rr = s * 16 + (lane & 15);
+    const int cc = kc * 16 + ((lane & 16) ? 8 : 0);
+    ldmatrix_x4(a_A, smem_u32(&sm.Abf[sw_off64(rr, cc)]));
+    #pragma unroll
+    for (int n = 0; n < 8; ++n) {
+      const int col = hf * 64 + n * 8;
+      const int lrow = kc * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
+      unsigned bw[2], bu[2];
+      ldmatrix_x2_trans(bw, smem_u32(&sm.kbe_t[sw_off(lrow, col)]));
+      ldmatrix_x2_trans(bu, smem_u32(&sm.vwg_t[sw_off(lrow, col)]));
+      mma_16x8x16(a_A, bw, &w_fr[n * 4]);
+      mma_16x8x16(a_A, bu, &u_fr[n * 4]);
+    }
+  }
+  #pragma unroll
+  for (int n = 0; n < 8; ++n)
+    #pragma unroll
+    for (int rr2 = 0; rr2 < 2; ++rr2)
+      #pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int i = n * 4 + rr2 * 2 + e;
+        const int trow = s * 16 + (lane >> 2) + rr2 * 8;
+        const int gc = hf * 64 + n * 8 + (lane & 3) * 2 + e;
+        if (trow < rows_here) {
+          const long off = ((bos + t_lo + trow) * H + i_h) * (long)kD + gc;
+          w_o[off] = __float2bfloat16(w_fr[i]);
+          u_o[off] = __float2bfloat16(u_fr[i]);
+        }
+      }
+}
+
 }  // namespace
 
 void gdn2_wy_dqkg(
@@ -1462,8 +2082,82 @@ void gdn2_wy_intra_bwd(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void gdn2_fwd_intra_fused(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
+    torch::Tensor b, torch::Tensor wg,
+    torch::Tensor Aqk_o, torch::Tensor Akk_o, torch::Tensor w_o,
+    torch::Tensor u_o, torch::Tensor kg_o,
+    c10::optional<torch::Tensor> qg_o, double scale) {
+  const at::cuda::CUDAGuard guard{q.device()};
+  const int B = q.size(0), T = q.size(1), H = q.size(2);
+  const int NT = (T + kBT - 1) / kBT;
+  dim3 grid(NT, B * H);
+  dim3 block(kWarps * 32);
+  size_t smem = sizeof(FwdShared);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (smem > 48 * 1024) {
+    cudaError_t e = cudaFuncSetAttribute(
+        gdn2_fwd_intra_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem);
+    TORCH_CHECK(e == cudaSuccess, "smem opt-in failed: ", cudaGetErrorString(e));
+  }
+  gdn2_fwd_intra_fused_kernel<<<grid, block, smem, stream>>>(
+      reinterpret_cast<const bf16*>(q.data_ptr()),
+      reinterpret_cast<const bf16*>(k.data_ptr()),
+      reinterpret_cast<const bf16*>(v.data_ptr()),
+      g.data_ptr<float>(),
+      reinterpret_cast<const bf16*>(b.data_ptr()),
+      reinterpret_cast<const bf16*>(wg.data_ptr()),
+      reinterpret_cast<bf16*>(Aqk_o.data_ptr()),
+      reinterpret_cast<bf16*>(Akk_o.data_ptr()),
+      reinterpret_cast<bf16*>(w_o.data_ptr()),
+      reinterpret_cast<bf16*>(u_o.data_ptr()),
+      reinterpret_cast<bf16*>(kg_o.data_ptr()),
+      qg_o.has_value() ? reinterpret_cast<bf16*>(qg_o->data_ptr()) : nullptr,
+      T, H, (float)scale);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gdn2_w_u_fused(
+    c10::optional<torch::Tensor> q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor g, torch::Tensor b, torch::Tensor wg, torch::Tensor A,
+    torch::Tensor w_o, torch::Tensor u_o, torch::Tensor kg_o,
+    c10::optional<torch::Tensor> qg_o) {
+  const at::cuda::CUDAGuard guard{k.device()};
+  const int B = k.size(0), T = k.size(1), H = k.size(2);
+  const int NT = (T + kBT - 1) / kBT;
+  dim3 grid(NT, B * H);
+  dim3 block(kWarps * 32);
+  size_t smem = sizeof(WuShared);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (smem > 48 * 1024) {
+    cudaError_t e = cudaFuncSetAttribute(
+        gdn2_w_u_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem);
+    TORCH_CHECK(e == cudaSuccess, "smem opt-in failed: ", cudaGetErrorString(e));
+  }
+  gdn2_w_u_fused_kernel<<<grid, block, smem, stream>>>(
+      q.has_value() ? reinterpret_cast<const bf16*>(q->data_ptr()) : nullptr,
+      reinterpret_cast<const bf16*>(k.data_ptr()),
+      reinterpret_cast<const bf16*>(v.data_ptr()),
+      g.data_ptr<float>(),
+      reinterpret_cast<const bf16*>(b.data_ptr()),
+      reinterpret_cast<const bf16*>(wg.data_ptr()),
+      reinterpret_cast<const bf16*>(A.data_ptr()),
+      reinterpret_cast<bf16*>(w_o.data_ptr()),
+      reinterpret_cast<bf16*>(u_o.data_ptr()),
+      reinterpret_cast<bf16*>(kg_o.data_ptr()),
+      qg_o.has_value() ? reinterpret_cast<bf16*>(qg_o->data_ptr()) : nullptr,
+      T, H);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gdn2_wy_dqkg", &gdn2_wy_dqkg, "GDN-2 wy_dqkg backward (SM120 CUDA)");
   m.def("gdn2_wy_intra_bwd", &gdn2_wy_intra_bwd,
         "GDN-2 merged wy_dqkg + intra backward (SM120 CUDA)");
+  m.def("gdn2_fwd_intra_fused", &gdn2_fwd_intra_fused,
+        "GDN-2 fused forward intra: scores + solve + WY auxiliaries");
+  m.def("gdn2_w_u_fused", &gdn2_w_u_fused,
+        "GDN-2 WY auxiliaries from saved A (backward recompute)");
 }
