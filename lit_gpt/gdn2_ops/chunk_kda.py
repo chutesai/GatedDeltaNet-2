@@ -60,13 +60,17 @@ from fla.utils import (
     IS_GATHER_SUPPORTED,
     IS_NVIDIA_HOPPER,
     IS_TF32_SUPPORTED,
-    USE_CUDA_GRAPH,
     autocast_custom_bwd,
     autocast_custom_fwd,
     autotune_cache_kwargs,
     check_shared_mem,
     input_guard,
 )
+
+# fla >= 0.5 removed this export; keep the old env-controlled behavior.
+import os as _os
+USE_CUDA_GRAPH = _os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
+
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 
@@ -960,6 +964,7 @@ def expand_h0(h0: torch.Tensor, context: FLACPContext):
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
     'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
+    'SAVE_O': lambda args: args['o'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
@@ -984,6 +989,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     h0,
     ht,
+    q,
+    Aqk,
+    o,
+    scale,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -1000,6 +1009,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     SAVE_NEW_VALUE: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRANSPOSE_STATE: tl.constexpr,
+    SAVE_O: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -1038,6 +1048,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     w += (bos * H + i_h).to(tl.int64) * K
     if SAVE_NEW_VALUE:
         v_new += (bos * H + i_h).to(tl.int64) * V
+    if SAVE_O:
+        q += (bos * Hq + i_h // (H // Hq)).to(tl.int64) * K
+        o += (bos * H + i_h).to(tl.int64) * V
+        Aqk += (bos * H + i_h).to(tl.int64) * BT
 
     if USE_INITIAL_STATE:
         h0 = h0 + i_nh * K*V
@@ -1130,6 +1144,63 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         if SAVE_NEW_VALUE:
             p_v = tl.make_block_ptr(v_new, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             tl.store(p_v, b_v.to(p_v.dtype.element_ty), boundary_check=(0, 1))
+
+        if SAVE_O:
+            # o = scale * (q * exp2(g_cumsum)) @ h_pre + tril(Aqk) @ v_new,
+            # computed here while h_pre sits in registers and b_v is v_new
+            # (before the tail-decay rescale below). Replaces the separate
+            # chunk_gla_fwd_o_gk pass over h.
+            b_o = tl.zeros([BT, BV], dtype=tl.float32)
+            p_q1 = tl.make_block_ptr(q, (T, K), (Hq*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
+            p_gq1 = tl.make_block_ptr(gk + (bos * H + i_h).to(tl.int64) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
+            b_q1 = tl.load(p_q1, boundary_check=(0, 1))
+            b_gq1 = tl.load(p_gq1, boundary_check=(0, 1)).to(tl.float32)
+            b_qg1 = (b_q1 * exp2(b_gq1)).to(b_q1.dtype)
+            if TRANSPOSE_STATE:
+                b_o += tl.dot(b_qg1, tl.trans(b_h1).to(b_qg1.dtype))
+            else:
+                b_o += tl.dot(b_qg1, b_h1.to(b_qg1.dtype))
+            if K > 64:
+                p_q2 = tl.make_block_ptr(q, (T, K), (Hq*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
+                p_gq2 = tl.make_block_ptr(gk + (bos * H + i_h).to(tl.int64) * K, (T, K), (H*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
+                b_q2 = tl.load(p_q2, boundary_check=(0, 1))
+                b_gq2 = tl.load(p_gq2, boundary_check=(0, 1)).to(tl.float32)
+                b_qg2 = (b_q2 * exp2(b_gq2)).to(b_q2.dtype)
+                if TRANSPOSE_STATE:
+                    b_o += tl.dot(b_qg2, tl.trans(b_h2).to(b_qg2.dtype))
+                else:
+                    b_o += tl.dot(b_qg2, b_h2.to(b_qg2.dtype))
+            if K > 128:
+                p_q3 = tl.make_block_ptr(q, (T, K), (Hq*K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
+                p_gq3 = tl.make_block_ptr(gk + (bos * H + i_h).to(tl.int64) * K, (T, K), (H*K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
+                b_q3 = tl.load(p_q3, boundary_check=(0, 1))
+                b_gq3 = tl.load(p_gq3, boundary_check=(0, 1)).to(tl.float32)
+                b_qg3 = (b_q3 * exp2(b_gq3)).to(b_q3.dtype)
+                if TRANSPOSE_STATE:
+                    b_o += tl.dot(b_qg3, tl.trans(b_h3).to(b_qg3.dtype))
+                else:
+                    b_o += tl.dot(b_qg3, b_h3.to(b_qg3.dtype))
+            if K > 192:
+                p_q4 = tl.make_block_ptr(q, (T, K), (Hq*K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
+                p_gq4 = tl.make_block_ptr(gk + (bos * H + i_h).to(tl.int64) * K, (T, K), (H*K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
+                b_q4 = tl.load(p_q4, boundary_check=(0, 1))
+                b_gq4 = tl.load(p_gq4, boundary_check=(0, 1)).to(tl.float32)
+                b_qg4 = (b_q4 * exp2(b_gq4)).to(b_q4.dtype)
+                if TRANSPOSE_STATE:
+                    b_o += tl.dot(b_qg4, tl.trans(b_h4).to(b_qg4.dtype))
+                else:
+                    b_o += tl.dot(b_qg4, b_h4.to(b_qg4.dtype))
+            b_o *= scale
+            o_t = tl.arange(0, BT)
+            m_A = o_t[:, None] >= o_t[None, :]
+            p_A = tl.make_block_ptr(Aqk, (T, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+            b_A = tl.load(p_A, boundary_check=(0, 1))
+            b_A = tl.where(m_A, b_A, 0.).to(k.dtype.element_ty)
+            # Round v_new to the storage dtype so the fused output matches the
+            # two-kernel path bit-for-bit (it reads v_new after the bf16 store).
+            b_o += tl.dot(b_A, b_v.to(k.dtype.element_ty))
+            p_o = tl.make_block_ptr(o, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
@@ -1600,6 +1671,9 @@ def chunk_gated_delta_rule_fwd_h(
     u: torch.Tensor,
     g: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
+    q: torch.Tensor | None = None,
+    Aqk: torch.Tensor | None = None,
+    scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
@@ -1638,6 +1712,8 @@ def chunk_gated_delta_rule_fwd_h(
         final_state = k.new_zeros(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
+    fuse_o = q is not None
+    o = torch.empty(B, T, H, V, device=k.device, dtype=k.dtype) if fuse_o else None
     def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
@@ -1649,6 +1725,10 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         h0=initial_state,
         ht=final_state,
+        q=q,
+        Aqk=Aqk,
+        o=o,
+        scale=scale if scale is not None else 1.0,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -1660,6 +1740,8 @@ def chunk_gated_delta_rule_fwd_h(
         USE_EXP2=use_exp2,
         TRANSPOSE_STATE=transpose_state_layout,
     )
+    if fuse_o:
+        return h, v_new, final_state, o
     return h, v_new, final_state
 
 def chunk_gated_delta_rule_bwd_dhu(
@@ -3624,8 +3706,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         chunk_indices=chunk_indices,
-        use_exp2=True,
-        transpose_state_layout=transpose_state_layout,
+        state_v_first=transpose_state_layout,
     )
 
     if cp_context is not None:
@@ -3645,8 +3726,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
-        use_exp2=True,
-        transpose_state_layout=transpose_state_layout,
+        state_v_first=transpose_state_layout,
     )
     if disable_recompute is False:
         # Delete to save memory
@@ -4162,8 +4242,7 @@ def chunk_kda_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        use_exp2=True,
-        transpose_state_layout=transpose_state_layout,
+        state_v_first=transpose_state_layout,
     )
 
     dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(

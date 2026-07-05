@@ -28,6 +28,7 @@ gate `w` on the value axis. See the kernel modules for the recurrence itself.
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -278,46 +279,95 @@ class GatedDeltaNet2(nn.Module):
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
+        # All seven first-stage projections read hidden_states; one merged
+        # GEMM reads it once instead of seven times (~4x less activation
+        # traffic and six fewer launches). torch.cat of the weights is
+        # autograd-exact; its 50MB copy is trivial next to the GEMM.
+        # GDN2_FUSED_PROJ=0 restores the separate projections.
+        _fused_proj = os.environ.get("GDN2_FUSED_PROJ", "1") == "1"
+        # The decay-gate activation (-exp(A_log) * softplus(f + dt_bias)) can
+        # run fused with the chunk cumsum inside the kernel: identical math,
+        # no fp32 torch chain, nothing extra saved for backward.
+        # GDN2_GATE_IN_KERNEL=0 restores the torch-side chain.
+        _gate_in_kernel = (
+            os.environ.get("GDN2_GATE_IN_KERNEL", "1") == "1" and mode == "chunk"
+        )
+        if _fused_proj:
+            w_cat = torch.cat(
+                (
+                    self.q_proj.weight,
+                    self.k_proj.weight,
+                    self.v_proj.weight,
+                    self.b_proj.weight,
+                    self.w_proj.weight,
+                    self.f_proj[0].weight,
+                    self.g_proj[0].weight,
+                ),
+                dim=0,
+            )
+            fused = F.linear(hidden_states, w_cat)
+            q_raw, k_raw, v_raw, b_raw, w_raw, f0, g0 = fused.split(
+                [
+                    self.key_dim, self.key_dim, self.value_dim,
+                    self.key_dim, self.value_dim,
+                    self.head_v_dim, self.head_v_dim,
+                ],
+                dim=-1,
+            )
+            f_pre = self.f_proj[1](f0)
+            g_gate_flat = self.g_proj[1](g0)
+        else:
+            q_raw = self.q_proj(hidden_states)
+            k_raw = self.k_proj(hidden_states)
+            v_raw = self.v_proj(hidden_states)
+            b_raw = self.b_proj(hidden_states)
+            w_raw = self.w_proj(hidden_states)
+            f_pre = self.f_proj(hidden_states)
+            g_gate_flat = self.g_proj(hidden_states)
+
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if last_state is not None:
                 conv_state_q, conv_state_k, conv_state_v = last_state["conv_state"]
             q, conv_state_q = self.q_conv1d(
-                x=self.q_proj(hidden_states),
+                x=q_raw,
                 cache=conv_state_q,
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
             )
             k, conv_state_k = self.k_conv1d(
-                x=self.k_proj(hidden_states),
+                x=k_raw,
                 cache=conv_state_k,
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
             )
             v, conv_state_v = self.v_conv1d(
-                x=self.v_proj(hidden_states),
+                x=v_raw,
                 cache=conv_state_v,
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
             )
         else:
-            q = F.silu(self.q_proj(hidden_states))
-            k = F.silu(self.k_proj(hidden_states))
-            v = F.silu(self.v_proj(hidden_states))
+            q = F.silu(q_raw)
+            k = F.silu(k_raw)
+            v = F.silu(v_raw)
 
-        # Channel-wise log-decay, computed in fp32 for numerical stability of
-        # the downstream cumulative sum. A_log is per-head and broadcast over
-        # the head's key channels; dt_bias is per-channel.
-        g = (
-            -self.A_log.float().exp().repeat_interleave(self.head_k_dim)
-            * F.softplus(self.f_proj(hidden_states).float() + self.dt_bias)
-        )
+        # Channel-wise log-decay. With the in-kernel gate the raw f_proj
+        # pre-activation is handed to the kernel, which applies
+        # -exp(A_log) * softplus(. + dt_bias) fused with the chunk cumsum.
+        if _gate_in_kernel:
+            g = f_pre
+        else:
+            g = (
+                -self.A_log.float().exp().repeat_interleave(self.head_k_dim)
+                * F.softplus(f_pre.float() + self.dt_bias)
+            )
 
         # GDN-2 gates, both squashed to [0, 1] by a sigmoid. b is the
         # channel-wise erase gate (key axis); w is the channel-wise write
         # gate (value axis).
-        b = self.b_proj(hidden_states).sigmoid()
-        w = self.w_proj(hidden_states).sigmoid()
+        b = b_raw.sigmoid()
+        w = w_raw.sigmoid()
 
         # Split the flat projection outputs into per-head tensors. Key-side
         # tensors (q, k, g, b) use head_k_dim; value-side (v, w) use head_v_dim.
@@ -354,7 +404,7 @@ class GatedDeltaNet2(nn.Module):
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
                 use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=False,
+                use_gate_in_kernel=_gate_in_kernel,
                 cu_seqlens=cu_seqlens,
             )
         elif mode == "fused_recurrent":
@@ -388,7 +438,7 @@ class GatedDeltaNet2(nn.Module):
 
         # SiLU-gated RMS norm on the recurrent output, then project back to
         # the model dimension. Repad if the input batch was unpadded above.
-        o = self.o_norm(o, rearrange(self.g_proj(hidden_states), "... (h d) -> ... h d", d=self.head_v_dim))
+        o = self.o_norm(o, rearrange(g_gate_flat, "... (h d) -> ... h d", d=self.head_v_dim))
         o = rearrange(o, "b t h d -> b t (h d)")
         o = self.o_proj(o)
         if attention_mask is not None:
