@@ -57,6 +57,9 @@ from __future__ import annotations
 
 from typing import Optional
 
+import os
+import warnings
+
 import torch
 import triton
 import triton.language as tl
@@ -1790,14 +1793,126 @@ def chunk_gdn2_bwd_kernel_intra(
 # Python-level wrappers that launch the backward Triton kernels and assemble
 # the full gradient set for the chunkwise backward pass.
 # =============================================================================
+# -----------------------------------------------------------------------------
+# Hand-written SM120 CUDA implementations of the backward hot path, selected
+# via GDN2_WY_IMPL (default: cuda):
+#   cuda        - single merged kernel for wy_dqkg + intra (the fp32 dAkk is
+#                 consumed in shared memory: no dA gmem round-trip, no bf16
+#                 dA handoff, no db2 NK-split/permute, exact scalar
+#                 diagonals). Falls back per-call to the split/Triton pair
+#                 for unsupported configs (varlen, transposed state layout,
+#                 K!=128/V!=128, safe_gate, bf16sr, non-sm120).
+#   cuda_split  - the standalone CUDA wy_dqkg kernel + Triton intra
+#                 (validation/debug arm; its dA crosses gmem at bf16
+#                 reduction-order level, which reaches final db/dk/dg as
+#                 per-seed sign-flipping offsets — autotune-re-pick class,
+#                 categorically unlike the systematic same-sign bias of the
+#                 reverted anchored diagonal, the step-~1000 NaN engine).
+#   triton      - pure Triton pair (upstream-exact reference path).
+# Any build/launch failure warns once and falls back to Triton permanently.
+# -----------------------------------------------------------------------------
+_wy_cuda_ext = None
+
+
+def _load_wy_cuda_ext():
+    global _wy_cuda_ext
+    if _wy_cuda_ext is None:
+        try:
+            from torch.utils.cpp_extension import load as _cpp_load
+
+            src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "gdn2_wy_dqkg_cuda.cu")
+            _wy_cuda_ext = _cpp_load(
+                name="gdn2_wy_dqkg_ext",
+                sources=[src],
+                extra_cuda_cflags=["-O3", "-arch=sm_120", "--use_fast_math",
+                                   "--expt-relaxed-constexpr"],
+                verbose=False,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"GDN2_WY_IMPL=cuda: building gdn2_wy_dqkg_cuda failed ({exc}); "
+                "using the Triton kernel instead."
+            )
+            _wy_cuda_ext = False
+    return _wy_cuda_ext or None
+
+
+def _wy_cuda_supported(q, k, v, v_new, g, b, wg, A, h, do, dh, dv, scale,
+                       cu_seqlens, chunk_size, transpose_state_layout):
+    # The CUDA kernel is specialized to the geometry it was validated on:
+    # dense batches, BT=64, K=V=128, standard state layout, bf16 operands
+    # with fp32 cumulative gates, sm_120, deterministic stores (no SR).
+    if cu_seqlens is not None or transpose_state_layout or scale is None:
+        return False
+    if chunk_size != 64 or k.shape[-1] != 128 or v.shape[-1] != 128:
+        return False
+    if os.environ.get("GDN2_GRAD_STORE_DTYPE", "fp32") == "bf16sr":
+        return False  # stochastic-rounding dw stores are Triton-only
+    if not q.is_cuda or torch.cuda.get_device_capability(q.device) != (12, 0):
+        return False
+    tensors = (q, k, v, v_new, b, wg, A, h, do, dh, dv)
+    if any(t.dtype != torch.bfloat16 or not t.is_contiguous() for t in tensors):
+        return False
+    if g.dtype != torch.float32 or not g.is_contiguous():
+        return False
+    return True
+
+
+def _try_merged_bwd_cuda(q, k, v, v_new, g, b, wg, A, h, do, dh, dv, dAqk,
+                         scale, cu_seqlens, chunk_size,
+                         transpose_state_layout, safe_gate):
+    """Single-kernel CUDA path for the wy_dqkg + intra backward pair
+    (GDN2_WY_IMPL=cuda). Replaces two Triton launches plus the dA round-trip
+    and the db2 NK-split/permute machinery; the fp32 dAkk never leaves
+    shared memory. Returns (dq, dk, dv, db, dw, dg) with the same dtypes the
+    Triton pair produces (dq/dk bf16 terminal stores), or None when the
+    configuration is unsupported (caller falls back to the pair).
+    """
+    if os.environ.get("GDN2_WY_IMPL", "cuda").lower() != "cuda":
+        return None
+    if safe_gate:
+        return None  # merged kernel implements the exact-diagonal path only
+    if not _wy_cuda_supported(q, k, v, v_new, g, b, wg, A, h, do, dh, dv,
+                              scale, cu_seqlens, chunk_size,
+                              transpose_state_layout):
+        return None
+    if dAqk.dtype != torch.float32 or not dAqk.is_contiguous():
+        return None
+    ext = _load_wy_cuda_ext()
+    if ext is None or not hasattr(ext, "gdn2_wy_intra_bwd"):
+        return None
+    dq_ws = torch.empty_like(q, dtype=torch.float32)
+    dk_ws = torch.empty_like(k, dtype=torch.float32)
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv2 = torch.empty_like(v)
+    dg = torch.empty_like(g, dtype=torch.float32)
+    db = torch.empty_like(b, dtype=torch.float32)
+    dw = torch.empty_like(wg)
+    try:
+        ext.gdn2_wy_intra_bwd(q, k, v, v_new, g, b, wg, A, h, do, dh, dv,
+                              dAqk, dq_ws, dk_ws, dq, dk, dv2, dg, db, dw,
+                              float(scale))
+    except Exception as exc:
+        global _wy_cuda_ext
+        _wy_cuda_ext = False
+        warnings.warn(
+            f"GDN2_WY_IMPL=cuda: merged kernel launch failed ({exc}); "
+            "falling back to the Triton kernels permanently."
+        )
+        return None
+    return dq, dk, dv2, db, dw, dg
+
+
 def chunk_gdn2_bwd_wy_dqkg_fused(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     v_new: torch.Tensor,
     g: torch.Tensor,
-    b: torch.Tensor,        
-    wg: torch.Tensor,       
+    b: torch.Tensor,
+    wg: torch.Tensor,
     A: torch.Tensor,
     h: torch.Tensor,
     do: torch.Tensor,
@@ -1823,6 +1938,33 @@ def chunk_gdn2_bwd_wy_dqkg_fused(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
+    if (os.environ.get("GDN2_WY_IMPL", "cuda").lower() in ("cuda", "cuda_split")
+            and _wy_cuda_supported(q, k, v, v_new, g, b, wg, A, h, do, dh, dv,
+                                   scale, cu_seqlens, BT,
+                                   transpose_state_layout)):
+        ext = _load_wy_cuda_ext()
+        if ext is not None:
+            dq = torch.empty_like(q, dtype=torch.float32)
+            dk = torch.empty_like(k, dtype=torch.float32)
+            dv2 = torch.empty_like(v)
+            dg = torch.empty_like(g, dtype=torch.float32)
+            db = torch.empty_like(b, dtype=torch.float32)
+            # Terminal bf16 store: one rounding from fp32 accumulators,
+            # same as the Triton path's fp32 store + boundary cast.
+            dw = torch.empty_like(wg)
+            dA = torch.empty_like(A, dtype=torch.float32)
+            try:
+                ext.gdn2_wy_dqkg(q, k, v, v_new, g, b, wg, A, h, do, dh, dv,
+                                 dq, dk, dv2, dg, db, dw, dA, float(scale))
+                return dq, dk, dv2, db, dw, dg, dA
+            except Exception as exc:
+                global _wy_cuda_ext
+                _wy_cuda_ext = False
+                warnings.warn(
+                    f"GDN2_WY_IMPL=cuda: kernel launch failed ({exc}); "
+                    "falling back to the Triton kernel permanently."
+                )
+
     dq = torch.empty_like(q, dtype=torch.float32)
     dk = torch.empty_like(k, dtype=torch.float32)
     dv2 = torch.empty_like(v)
@@ -1830,15 +1972,15 @@ def chunk_gdn2_bwd_wy_dqkg_fused(
     db = torch.empty_like(b, dtype=torch.float32)
     # dw is terminal (no later accumulation): store bf16 directly and skip
     # the 150MB cast kernel in the autograd wrapper.
-    # bf16 dw/db stores were CONVICTED (exhaustive 6-arm bisect) of a
-    # deterministic training NaN at step ~1000: the store rounding acts as a
-    # compounding gradient bias. fp32 accumulation with a single cast at the
-    # autograd boundary is upstream-exact and is the default; bf16 is opt-in
-    # and requires a >=2k-step loss A/B (it moved the NaN onset, so it is a
-    # dynamics-relevant perturbation, not free bandwidth).
-    import os as _os
-
-    _gsd = _os.environ.get("GDN2_GRAD_STORE_DTYPE", "fp32")
+    # NOTE on the NaN saga: a 6-arm training bisect initially convicted bf16
+    # dw/db stores of the deterministic step-~1000 NaN, but tensor-level
+    # forensics later overturned that verdict — fp32 vs bf16 store modes are
+    # equivalent (one rounding either way); the real cause was a dir-bias in
+    # the (since reverted) anchored-diagonal bwd_intra rewrite, which ran in
+    # every bisect arm because GDN2_EXACT_INTRA only gates the forward.
+    # fp32 stores with a single cast at the autograd boundary remain the
+    # default; bf16/bf16sr stay opt-in pending a >=2k-step loss A/B.
+    _gsd = os.environ.get("GDN2_GRAD_STORE_DTYPE", "fp32")
     _gs_dtype = wg.dtype if _gsd in ("bf16", "bf16sr") else torch.float32
     dw = torch.empty_like(wg, dtype=_gs_dtype)
     dA = torch.empty_like(A, dtype=torch.float32)
@@ -1872,8 +2014,7 @@ def chunk_gdn2_bwd_wy_dqkg_fused(
         H=H,
         K=K,
         V=V,
-        USE_SR=(dw.dtype != torch.float32
-                and _os.environ.get("GDN2_GRAD_STORE_DTYPE", "fp32") == "bf16sr"),
+        USE_SR=(dw.dtype != torch.float32 and _gsd == "bf16sr"),
         BT=BT,
         TRANSPOSE_STATE=transpose_state_layout,
     )
@@ -2053,42 +2194,49 @@ def chunk_gdn2_bwd(
         transpose_state_layout=transpose_state_layout,
     )
 
-    dq, dk, dv, db, dw, dg, dAkk = chunk_gdn2_bwd_wy_dqkg_fused(
-        q=q,
-        k=k,
-        v=v,
-        v_new=v_new,
-        g=g,
-        b=b,
-        wg=wg,
-        A=Akk,
-        h=h,
-        do=do,
-        dh=dh,
-        dv=dv,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        transpose_state_layout=transpose_state_layout,
+    merged = _try_merged_bwd_cuda(
+        q, k, v, v_new, g, b, wg, Akk, h, do, dh, dv, dAqk,
+        scale, cu_seqlens, chunk_size, transpose_state_layout, safe_gate,
     )
+    if merged is not None:
+        dq, dk, dv, db, dw, dg = merged
+    else:
+        dq, dk, dv, db, dw, dg, dAkk = chunk_gdn2_bwd_wy_dqkg_fused(
+            q=q,
+            k=k,
+            v=v,
+            v_new=v_new,
+            g=g,
+            b=b,
+            wg=wg,
+            A=Akk,
+            h=h,
+            do=do,
+            dh=dh,
+            dv=dv,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            transpose_state_layout=transpose_state_layout,
+        )
 
-    dq, dk, db, dg = chunk_gdn2_bwd_intra(
-        q=q,
-        k=k,
-        g=g,
-        b=b,
-        dAqk=dAqk,
-        dAkk=dAkk,
-        dq=dq,
-        dk=dk,
-        db=db,
-        dg=dg,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        safe_gate=safe_gate,
-    )
+        dq, dk, db, dg = chunk_gdn2_bwd_intra(
+            q=q,
+            k=k,
+            g=g,
+            b=b,
+            dAqk=dAqk,
+            dAkk=dAkk,
+            dq=dq,
+            dk=dk,
+            db=db,
+            dg=dg,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=safe_gate,
+        )
 
     dA_log, dt_bias_grad = None, None
     dg = chunk_local_cumsum(
