@@ -1515,6 +1515,12 @@ def chunk_gdn2_bwd_kernel_wy_dqkg_fused(
             b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
             b_dk += tl.dot(b_v_new, b_dh.to(b_v_new.dtype))
             b_dw_flow += tl.dot(b_dv.to(b_v_new.dtype), b_h.to(b_v_new.dtype))
+            # Phase boundary between the dot pipeline above and the i_k==0
+            # store block below.  The sibling KDA kernel carries this barrier
+            # with "DO NOT REMOVE THIS LINE!" — removing it here allows a
+            # shared-memory/WGMMA phase race that silently corrupts backward
+            # gradients (sporadic, no metric warning, chaotic NaN onset).
+            tl.debug_barrier()
 
             if i_k == 0:
                 p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
