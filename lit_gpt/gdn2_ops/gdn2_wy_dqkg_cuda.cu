@@ -1228,19 +1228,31 @@ gdn2_wy_intra_bwd_kernel(
     if (s > 0) {
       const float gn0 = g_own[0];
       const float gn1 = g_own[1];
-      for (int j = 0; j < s * 16; ++j) {
-        const float kE0 = __bfloat162float(k_s[sw_off(j, gc0 + 0)])
-                          * exp2f(gn0 - g_at(j, 0));
-        const float kE1 = __bfloat162float(k_s[sw_off(j, gc0 + 1)])
-                          * exp2f(gn1 - g_at(j, 1));
+      // 4-deep load batching: issue the g/k loads for four j's before any
+      // exp2/FMA consumes them (s*16 is always a multiple of 4). Same math,
+      // same accumulation order — pure memory-level parallelism.
+      for (int j = 0; j < s * 16; j += 4) {
+        float gj0[4], gj1[4], kj0[4], kj1[4];
         #pragma unroll
-        for (int t = 0; t < 16; ++t) {
-          const float a_qk = dAqk_s[(s * 16 + t) * kBT + j];
-          const float a_kk = dAkk_s[(s * 16 + t) * kBT + j];
-          dq2[t * 2 + 0] += a_qk * kE0;
-          dq2[t * 2 + 1] += a_qk * kE1;
-          dk2[t * 2 + 0] += a_kk * kE0;
-          dk2[t * 2 + 1] += a_kk * kE1;
+        for (int u = 0; u < 4; ++u) {
+          gj0[u] = g_at(j + u, 0);
+          gj1[u] = g_at(j + u, 1);
+          kj0[u] = __bfloat162float(k_s[sw_off(j + u, gc0 + 0)]);
+          kj1[u] = __bfloat162float(k_s[sw_off(j + u, gc0 + 1)]);
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+          const float kE0 = kj0[u] * exp2f(gn0 - gj0[u]);
+          const float kE1 = kj1[u] * exp2f(gn1 - gj1[u]);
+          #pragma unroll
+          for (int t = 0; t < 16; ++t) {
+            const float a_qk = dAqk_s[(s * 16 + t) * kBT + (j + u)];
+            const float a_kk = dAkk_s[(s * 16 + t) * kBT + (j + u)];
+            dq2[t * 2 + 0] += a_qk * kE0;
+            dq2[t * 2 + 1] += a_qk * kE1;
+            dk2[t * 2 + 0] += a_kk * kE0;
+            dk2[t * 2 + 1] += a_kk * kE1;
+          }
         }
       }
       #pragma unroll
@@ -1305,15 +1317,13 @@ gdn2_wy_intra_bwd_kernel(
     if (s * 16 + 16 < rows_here) {
       const float gl0 = g_own[(jmax - 1) * 2 + 0];
       const float gl1 = g_own[(jmax - 1) * 2 + 1];
-      for (int j = s * 16 + 16; j < rows_here; ++j) {
-        const float E0 = exp2f(g_at(j, 0) - gl0);
-        const float E1 = exp2f(g_at(j, 1) - gl1);
-        const float qE0 = __bfloat162float(q_s[sw_off(j, gc0 + 0)]) * E0;
-        const float qE1 = __bfloat162float(q_s[sw_off(j, gc0 + 1)]) * E1;
-        const float kbE0 = __bfloat162float(k_s[sw_off(j, gc0 + 0)])
-                           * __bfloat162float(b_s[sw_off(j, gc0 + 0)]) * E0;
-        const float kbE1 = __bfloat162float(k_s[sw_off(j, gc0 + 1)])
-                           * __bfloat162float(b_s[sw_off(j, gc0 + 1)]) * E1;
+      // 4-deep load batching with a scalar tail (rows_here need not be a
+      // multiple of 4). Same math and accumulation order as the plain loop.
+      const int jend4 = s * 16 + 16 + (((rows_here - (s * 16 + 16)) >> 2) << 2);
+      auto col_body = [&](int j, float E0, float E1, float q0, float q1,
+                          float kb0, float kb1) {
+        const float qE0 = q0 * E0, qE1 = q1 * E1;
+        const float kbE0 = kb0 * E0, kbE1 = kb1 * E1;
         #pragma unroll
         for (int t = 0; t < 16; ++t) {
           const float a_qk = dAqk_s[j * kBT + (s * 16 + t)];
@@ -1321,6 +1331,35 @@ gdn2_wy_intra_bwd_kernel(
           dkt[t * 2 + 0] += a_qk * qE0 + a_kk * kbE0;
           dkt[t * 2 + 1] += a_qk * qE1 + a_kk * kbE1;
         }
+      };
+      for (int j = s * 16 + 16; j < jend4; j += 4) {
+        float gj0[4], gj1[4], q0[4], q1[4], kb0[4], kb1[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+          gj0[u] = g_at(j + u, 0);
+          gj1[u] = g_at(j + u, 1);
+          q0[u] = __bfloat162float(q_s[sw_off(j + u, gc0 + 0)]);
+          q1[u] = __bfloat162float(q_s[sw_off(j + u, gc0 + 1)]);
+          kb0[u] = __bfloat162float(k_s[sw_off(j + u, gc0 + 0)])
+                   * __bfloat162float(b_s[sw_off(j + u, gc0 + 0)]);
+          kb1[u] = __bfloat162float(k_s[sw_off(j + u, gc0 + 1)])
+                   * __bfloat162float(b_s[sw_off(j + u, gc0 + 1)]);
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; ++u)
+          col_body(j + u, exp2f(gj0[u] - gl0), exp2f(gj1[u] - gl1),
+                   q0[u], q1[u], kb0[u], kb1[u]);
+      }
+      for (int j = jend4; j < rows_here; ++j) {
+        const float E0 = exp2f(g_at(j, 0) - gl0);
+        const float E1 = exp2f(g_at(j, 1) - gl1);
+        col_body(j, E0, E1,
+                 __bfloat162float(q_s[sw_off(j, gc0 + 0)]),
+                 __bfloat162float(q_s[sw_off(j, gc0 + 1)]),
+                 __bfloat162float(k_s[sw_off(j, gc0 + 0)])
+                     * __bfloat162float(b_s[sw_off(j, gc0 + 0)]),
+                 __bfloat162float(k_s[sw_off(j, gc0 + 1)])
+                     * __bfloat162float(b_s[sw_off(j, gc0 + 1)]));
       }
       #pragma unroll
       for (int t = 0; t < 16; ++t) {
@@ -1393,16 +1432,18 @@ gdn2_wy_intra_bwd_kernel(
 // g stays in gmem (__ldg; the Triton pipeline re-reads it per kernel too).
 // ============================================================================
 
+// 40KB total -> 2 CTAs/SM (16 warps): F1 reads q/k/b/g straight from gmem
+// (L1-resident for the CTA's lifetime — the Triton chain re-reads them from
+// DRAM three times), and F3 fuses its operand transforms into the load path
+// like the w_u kernel. The fp32 workspaces are overlaid by the F3 bf16
+// operand tiles after their last use.
 struct FwdShared {
-  bf16 k_t[kBT * kD];      // 16KB  k tile (all phases)
-  bf16 qv_t[kBT * kD];     // 16KB  q (F1) | v*wg (F3)
-  bf16 b_t[kBT * kD];      // 16KB  b tile (F1) | kb*2^g (F3)
-  float Afull[kBT * kBT];  // 16KB  assembled (I+T)^{-1}
-  float Traw[kBT * kBT];   // 16KB  raw off-diag T blocks (F1/F2) | wg bf16 (F3)
-  bf16 Abf[kBT * kBT];     //  8KB  bf16 A for the F3 tensor-core dots
+  float Traw[kBT * kBT];   // 16KB raw off-diag T (F1/F2) -> kb*2^g bf16 (F3)
+  float Afull[kBT * kBT];  // 16KB (I+T)^{-1} (F1/F2)     -> v*wg  bf16 (F3)
+  bf16 Abf[kBT * kBT];     //  8KB bf16 A (F3 mma; also the Akk store source)
 };
 
-__global__ void __launch_bounds__(kWarps * 32, 1)
+__global__ void __launch_bounds__(kWarps * 32, 2)
 gdn2_fwd_intra_fused_kernel(
     const bf16* __restrict__ q,
     const bf16* __restrict__ k,
@@ -1439,20 +1480,9 @@ gdn2_fwd_intra_fused_kernel(
     return __ldg(g + g0 + (long)t * hk + c);
   };
 
-  // ---- stage k, q, b; zero Traw and Afull ----
-  for (int idx = threadIdx.x; idx < kBT * (kD / 8); idx += kWarps * 32) {
-    const int r = idx >> 4, c8 = (idx & 15) << 3;
-    const bool ok = r < rows_here;
-    cp_async_16(smem_u32(&sm.k_t[sw_off(r, c8)]), rowp(k, r, c8), ok);
-    cp_async_16(smem_u32(&sm.qv_t[sw_off(r, c8)]), rowp(q, r, c8), ok);
-    cp_async_16(smem_u32(&sm.b_t[sw_off(r, c8)]), rowp(b, r, c8), ok);
-  }
-  cp_async_commit();
-  for (int idx = threadIdx.x; idx < kBT * kBT; idx += kWarps * 32) {
+  // ---- zero the raw-T workspace (upper/invalid blocks must read as 0) ----
+  for (int idx = threadIdx.x; idx < kBT * kBT; idx += kWarps * 32)
     sm.Traw[idx] = 0.f;
-    sm.Afull[idx] = 0.f;
-  }
-  cp_async_wait<0>();
   __syncthreads();
 
   // ================================ F1 ================================
@@ -1491,9 +1521,12 @@ gdn2_fwd_intra_fused_kernel(
             #pragma unroll
             for (int cc = 0; cc < 8; ++cc) gt8[cc] = 0.f;
           }
-          uint4 qraw = *reinterpret_cast<const uint4*>(&sm.qv_t[sw_off(trow, c8)]);
-          uint4 braw = *reinterpret_cast<const uint4*>(&sm.b_t[sw_off(trow, c8)]);
-          uint4 kraw = *reinterpret_cast<const uint4*>(&sm.k_t[sw_off(trow, c8)]);
+          // own-row q/b/k from gmem; clamp the row when invalid (the loads
+          // must stay in-bounds — results are zeroed via ef anyway).
+          const int trs = tv ? trow : (bi * 16);
+          uint4 qraw = __ldg(reinterpret_cast<const uint4*>(rowp(q, trs, c8)));
+          uint4 braw = __ldg(reinterpret_cast<const uint4*>(rowp(b, trs, c8)));
+          uint4 kraw = __ldg(reinterpret_cast<const uint4*>(rowp(k, trs, c8)));
           const bf16* qv8 = reinterpret_cast<const bf16*>(&qraw);
           const bf16* bv8 = reinterpret_cast<const bf16*>(&braw);
           const bf16* kv8 = reinterpret_cast<const bf16*>(&kraw);
@@ -1514,7 +1547,7 @@ gdn2_fwd_intra_fused_kernel(
           float gj8[8];
           gj8[0] = j0f.x; gj8[1] = j0f.y; gj8[2] = j0f.z; gj8[3] = j0f.w;
           gj8[4] = j1f.x; gj8[5] = j1f.y; gj8[6] = j1f.z; gj8[7] = j1f.w;
-          uint4 kjraw = *reinterpret_cast<const uint4*>(&sm.k_t[sw_off(jrow, c8)]);
+          uint4 kjraw = __ldg(reinterpret_cast<const uint4*>(rowp(k, jrow, c8)));
           const bf16* kj8 = reinterpret_cast<const bf16*>(&kjraw);
           #pragma unroll
           for (int cc = 0; cc < 8; ++cc) {
@@ -1548,24 +1581,45 @@ gdn2_fwd_intra_fused_kernel(
       const int anchor = d * 16 + min(8, rows_here - d * 16 - 1);
       const int ncol = d * 16 + n;                 // absolute column row-index
       const bool nv = n < rd;
-      for (int c = 0; c < kD; ++c) {
-        const float gn = g_at(anchor, c);
-        // own row's left-operand pieces (lane n also acts as row n)
-        const float gr = nv ? g_at(ncol, c) : 0.f;
-        const float e_own = nv ? exp2f(fminf(gr - gn, 110.f)) : 0.f;
-        const float q_own = __bfloat162float(sm.qv_t[sw_off(ncol, c)]) * e_own;
-        const float bk_own = __bfloat162float(sm.b_t[sw_off(ncol, c)])
-                             * __bfloat162float(sm.k_t[sw_off(ncol, c)]) * e_own;
-        const float f_own = nv
-            ? __bfloat162float(sm.k_t[sw_off(ncol, c)])
-              * exp2f(fminf(gn - gr, 110.f))
-            : 0.f;
+      const int nrow = nv ? ncol : (d * 16);      // clamped in-bounds row
+      const float* ganc = g + g0 + (long)anchor * hk;
+      const float* gnrw = g + g0 + (long)nrow * hk;
+      for (int c8 = 0; c8 < kD; c8 += 8) {
+        float gn8[8], gr8[8], qe8[8], bke8[8], f8[8];
+        {
+          const float4 a0 = __ldg(reinterpret_cast<const float4*>(ganc + c8));
+          const float4 a1 = __ldg(reinterpret_cast<const float4*>(ganc + c8 + 4));
+          gn8[0] = a0.x; gn8[1] = a0.y; gn8[2] = a0.z; gn8[3] = a0.w;
+          gn8[4] = a1.x; gn8[5] = a1.y; gn8[6] = a1.z; gn8[7] = a1.w;
+          const float4 r0 = __ldg(reinterpret_cast<const float4*>(gnrw + c8));
+          const float4 r1 = __ldg(reinterpret_cast<const float4*>(gnrw + c8 + 4));
+          gr8[0] = r0.x; gr8[1] = r0.y; gr8[2] = r0.z; gr8[3] = r0.w;
+          gr8[4] = r1.x; gr8[5] = r1.y; gr8[6] = r1.z; gr8[7] = r1.w;
+        }
+        const uint4 qraw = __ldg(reinterpret_cast<const uint4*>(rowp(q, nrow, c8)));
+        const uint4 braw = __ldg(reinterpret_cast<const uint4*>(rowp(b, nrow, c8)));
+        const uint4 kraw = __ldg(reinterpret_cast<const uint4*>(rowp(k, nrow, c8)));
+        const bf16* qp = reinterpret_cast<const bf16*>(&qraw);
+        const bf16* bp = reinterpret_cast<const bf16*>(&braw);
+        const bf16* kp = reinterpret_cast<const bf16*>(&kraw);
+        #pragma unroll
+        for (int cc = 0; cc < 8; ++cc) {
+          const float e_own = nv ? exp2f(fminf(gr8[cc] - gn8[cc], 110.f)) : 0.f;
+          qe8[cc] = __bfloat162float(qp[cc]) * e_own;
+          bke8[cc] = __bfloat162float(bp[cc]) * __bfloat162float(kp[cc]) * e_own;
+          f8[cc] = nv ? __bfloat162float(kp[cc])
+                        * exp2f(fminf(gn8[cc] - gr8[cc], 110.f))
+                      : 0.f;
+        }
         #pragma unroll
         for (int m = 0; m < 16; ++m) {
-          const float qm = __shfl_sync(hmask, q_own, m, 16);
-          const float bkm = __shfl_sync(hmask, bk_own, m, 16);
-          Aqkcol[m] += qm * f_own;
-          Tcol[m] += bkm * f_own;
+          #pragma unroll
+          for (int cc = 0; cc < 8; ++cc) {
+            const float qm = __shfl_sync(hmask, qe8[cc], m, 16);
+            const float bkm = __shfl_sync(hmask, bke8[cc], m, 16);
+            Aqkcol[m] += qm * f8[cc];
+            Tcol[m] += bkm * f8[cc];
+          }
         }
       }
       // store the FULL Aqk diagonal block for valid rows, with explicit
@@ -1719,19 +1773,10 @@ gdn2_fwd_intra_fused_kernel(
   __syncthreads();
 
   // ================================ F3 ================================
-  // Store Akk bf16 (upper blocks zero) while building the bf16 A tile, turn
-  // b_t into kb*2^g and qv_t into v*wg (both bf16-rounded exactly like the
-  // Triton w_u kernel), then w/u on tensor cores.
+  // Abf + Akk store first (they read Afull), then overlay Traw/Afull with
+  // the bf16 kb*2^g and v*wg tiles built straight from gmem (kg/qg emitted
+  // in the same fused pass, like the w_u kernel), then w/u on tensor cores.
   {
-    bf16* wg_s = reinterpret_cast<bf16*>(sm.Traw);
-    for (int idx = threadIdx.x; idx < kBT * (kD / 8); idx += kWarps * 32) {
-      const int r = idx >> 4, c8 = (idx & 15) << 3;
-      const bool ok = r < rows_here;
-      cp_async_16(smem_u32(&sm.qv_t[sw_off(r, c8)]), rowp(v, r, c8), ok);
-      cp_async_16(smem_u32(&wg_s[sw_off(r, c8)]), rowp(wg, r, c8), ok);
-    }
-    cp_async_commit();
-
     for (int idx = threadIdx.x; idx < kBT * kBT; idx += kWarps * 32) {
       const int r = idx / kBT, c = idx % kBT;
       const bool lower = (c >> 4) <= (r >> 4);
@@ -1741,49 +1786,71 @@ gdn2_fwd_intra_fused_kernel(
       if (r < rows_here)
         Akk_o[((bos + t_lo + r) * H + i_h) * (long)kBT + c] = ab;
     }
+    __syncthreads();   // Afull/Traw fully consumed; overlays may begin
 
-    // kg = k * exp2(g_last - g) (masked rows), from k smem + g gmem.
+    bf16* kbe_s = reinterpret_cast<bf16*>(sm.Traw);
+    bf16* vwg_s = reinterpret_cast<bf16*>(sm.Afull);
     const int lastr = rows_here - 1;
-    for (int idx = threadIdx.x; idx < kBT * kD; idx += kWarps * 32) {
-      const int r = idx >> 7, c = idx & 127;
-      if (r >= rows_here) continue;
-      const float kk = __bfloat162float(sm.k_t[sw_off(r, c)]);
-      const float e = exp2f(g_at(lastr, c) - g_at(r, c));
-      kg_o[((bos + t_lo + r) * H + i_h) * (long)kD + c] =
-          __float2bfloat16(kk * e);
-    }
-    // qg = q * exp2(g) (optional; q re-read from gmem — qv_t now holds v).
-    if (qg_o != nullptr) {
-      for (int idx = threadIdx.x; idx < kBT * kD; idx += kWarps * 32) {
-        const int r = idx >> 7, c = idx & 127;
-        if (r >= rows_here) continue;
-        const float qq = __bfloat162float(__ldg(rowp(q, r, c)));
-        qg_o[((bos + t_lo + r) * H + i_h) * (long)kD + c] =
-            __float2bfloat16(qq * exp2f(g_at(r, c)));
-      }
-    }
-    // b_t := bf16(k * b * 2^g)  (b_t is dead as raw b after F1).
-    for (int idx = threadIdx.x; idx < kBT * kD; idx += kWarps * 32) {
-      const int r = idx >> 7, c = idx & 127;
-      const int sw = sw_off(r, c);
-      float kbe = 0.f;
+    const long glast = g0 + (long)lastr * hk;
+    for (int idx = threadIdx.x; idx < kBT * (kD / 8); idx += kWarps * 32) {
+      const int r = idx >> 4, c8 = (idx & 15) << 3;
+      bf16 kbe8[8], vwg8[8];
       if (r < rows_here) {
-        kbe = __bfloat162float(sm.k_t[sw]) * __bfloat162float(sm.b_t[sw])
-              * exp2f(g_at(r, c));
+        const long grow = g0 + (long)r * hk;
+        const uint4 kk8 = __ldg(reinterpret_cast<const uint4*>(rowp(k, r, c8)));
+        const uint4 bb8 = __ldg(reinterpret_cast<const uint4*>(rowp(b, r, c8)));
+        const uint4 vv8 = __ldg(reinterpret_cast<const uint4*>(rowp(v, r, c8)));
+        const uint4 ww8 = __ldg(reinterpret_cast<const uint4*>(rowp(wg, r, c8)));
+        const bf16* kp = reinterpret_cast<const bf16*>(&kk8);
+        const bf16* bp = reinterpret_cast<const bf16*>(&bb8);
+        const bf16* vp = reinterpret_cast<const bf16*>(&vv8);
+        const bf16* wp = reinterpret_cast<const bf16*>(&ww8);
+        float gr[8], gl[8];
+        {
+          const float4 a0 = __ldg(reinterpret_cast<const float4*>(g + grow + c8));
+          const float4 a1 = __ldg(reinterpret_cast<const float4*>(g + grow + c8 + 4));
+          gr[0] = a0.x; gr[1] = a0.y; gr[2] = a0.z; gr[3] = a0.w;
+          gr[4] = a1.x; gr[5] = a1.y; gr[6] = a1.z; gr[7] = a1.w;
+          const float4 l0 = __ldg(reinterpret_cast<const float4*>(g + glast + c8));
+          const float4 l1 = __ldg(reinterpret_cast<const float4*>(g + glast + c8 + 4));
+          gl[0] = l0.x; gl[1] = l0.y; gl[2] = l0.z; gl[3] = l0.w;
+          gl[4] = l1.x; gl[5] = l1.y; gl[6] = l1.z; gl[7] = l1.w;
+        }
+        bf16 kg8[8];
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const float kk = __bfloat162float(kp[e]);
+          kbe8[e] = __float2bfloat16(kk * __bfloat162float(bp[e])
+                                     * exp2f(gr[e]));
+          vwg8[e] = __float2bfloat16(__bfloat162float(vp[e])
+                                     * __bfloat162float(wp[e]));
+          kg8[e] = __float2bfloat16(kk * exp2f(gl[e] - gr[e]));
+        }
+        *reinterpret_cast<uint4*>(
+            &kg_o[((bos + t_lo + r) * H + i_h) * (long)kD + c8]) =
+            *reinterpret_cast<uint4*>(kg8);
+        if (qg_o != nullptr) {
+          const uint4 qq8 = __ldg(reinterpret_cast<const uint4*>(rowp(q, r, c8)));
+          const bf16* qp = reinterpret_cast<const bf16*>(&qq8);
+          bf16 qg8[8];
+          #pragma unroll
+          for (int e = 0; e < 8; ++e)
+            qg8[e] = __float2bfloat16(__bfloat162float(qp[e]) * exp2f(gr[e]));
+          *reinterpret_cast<uint4*>(
+              &qg_o[((bos + t_lo + r) * H + i_h) * (long)kD + c8]) =
+              *reinterpret_cast<uint4*>(qg8);
+        }
+      } else {
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          kbe8[e] = __float2bfloat16(0.f);
+          vwg8[e] = __float2bfloat16(0.f);
+        }
       }
-      sm.b_t[sw] = __float2bfloat16(kbe);
-    }
-    cp_async_wait<0>();
-    __syncthreads();
-    // qv_t := bf16(v * wg) in place (each element owned by one thread).
-    for (int idx = threadIdx.x; idx < kBT * kD; idx += kWarps * 32) {
-      const int r = idx >> 7, c = idx & 127;
-      const int sw = sw_off(r, c);
-      float vw = 0.f;
-      if (r < rows_here) {
-        vw = __bfloat162float(sm.qv_t[sw]) * __bfloat162float(wg_s[sw]);
-      }
-      sm.qv_t[sw] = __float2bfloat16(vw);
+      *reinterpret_cast<uint4*>(&kbe_s[sw_off(r, c8)]) =
+          *reinterpret_cast<uint4*>(kbe8);
+      *reinterpret_cast<uint4*>(&vwg_s[sw_off(r, c8)]) =
+          *reinterpret_cast<uint4*>(vwg8);
     }
     __syncthreads();
 
@@ -1804,8 +1871,8 @@ gdn2_fwd_intra_fused_kernel(
         const int col = hf * 64 + n * 8;
         const int lrow = kc * 16 + (lane & 7) + ((lane & 8) ? 8 : 0);
         unsigned bw[2], bu[2];
-        ldmatrix_x2_trans(bw, smem_u32(&sm.b_t[sw_off(lrow, col)]));
-        ldmatrix_x2_trans(bu, smem_u32(&sm.qv_t[sw_off(lrow, col)]));
+        ldmatrix_x2_trans(bw, smem_u32(&kbe_s[sw_off(lrow, col)]));
+        ldmatrix_x2_trans(bu, smem_u32(&vwg_s[sw_off(lrow, col)]));
         mma_16x8x16(a_A, bw, &w_fr[n * 4]);
         mma_16x8x16(a_A, bu, &u_fr[n * 4]);
       }

@@ -1190,7 +1190,10 @@ def chunk_gdn2_fwd(
         w, u, qg, kg, v_new = None, None, None, None, None
         if not return_intermediate_states:
             h = None
-        if use_gate_in_kernel:
+        # GDN2_SAVE_G=1 keeps the cumulative gates for the backward
+        # (+[B,T,H,K] fp32 per layer) instead of re-running the gate cumsum
+        # there. Bit-identical numerics — it is literally the same tensor.
+        if use_gate_in_kernel and _os.environ.get("GDN2_SAVE_G", "0") != "1":
             g = None
     return o, final_state, g, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state
 
@@ -2193,7 +2196,8 @@ def chunk_gdn2_bwd(
         where db is [B,T,H,K] and dw is [B,T,H,V] (the new GDN-2 gradients).
     """
     if not disable_recompute:
-        if use_gate_in_kernel:
+        if use_gate_in_kernel and g is None:
+            # (g is non-None here when the forward kept it via GDN2_SAVE_G=1.)
             g = kda_gate_chunk_cumsum(
                 g=g_org,
                 A_log=A_log,
