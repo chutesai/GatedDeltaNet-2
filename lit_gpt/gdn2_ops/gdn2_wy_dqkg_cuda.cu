@@ -381,19 +381,33 @@ gdn2_wy_dqkg_kernel(
   {
     // dwf = -dwf; store dwf (bf16) to smem t3-as-[64x64 half] for the two
     // A-consuming dots; also compute dA += dwf @ (kg*b)^T via C->A reuse.
-    // kg*b into t1-repurpose... build kgb tile [64, 64-half] in t3:
+    // Each half-warp holds its OWN K-half of dwf in registers, so its dA
+    // partial needs kgb columns from THAT K-half: stage the lower K-half
+    // into t2 and the upper into t3 (same two-buffer rule the dwf staging
+    // below already documents; t2/dv is dead here, both tiles re-clobbered
+    // only after the dA dot). The previous single-tile version indexed the
+    // source by the WRITER thread's half (gc = hf*64 + c) with a destination
+    // keyed only on (r, c) — a period-4 K-half scramble of kgb that biased
+    // dA (and through it db/dg/dk) by ~10% in a structured, non-zero-mean
+    // way: the erase/decay-gate gradient bias behind the slow state-norm
+    // runaway (o_norm absmax march -> NaN) in long training runs.
     __syncthreads();
     for (int idx = threadIdx.x; idx < kBT * kBV; idx += kWarps * 32) {
       const int r = idx / kBV, c = idx % kBV;      // c within half
-      const int gc = hf * 64 + c;
-      float kk = __bfloat162float(sm.h_t[sw_off(r, gc)]);
-      float bb = __bfloat162float(sm.dh_t[sw_off(r, gc)]);
-      float gg = (r < rows_here) ? exp2f(sm.u.gtile[r * kD + gc]) : 0.f;
-      sm.t3[sw_off64(r, c)] = __float2bfloat16(kk * gg * bb);  // kg*b
+      const float gg0 = (r < rows_here) ? exp2f(sm.u.gtile[r * kD + c]) : 0.f;
+      const float gg1 = (r < rows_here) ? exp2f(sm.u.gtile[r * kD + 64 + c]) : 0.f;
+      const float kk0 = __bfloat162float(sm.h_t[sw_off(r, c)]);
+      const float bb0 = __bfloat162float(sm.dh_t[sw_off(r, c)]);
+      const float kk1 = __bfloat162float(sm.h_t[sw_off(r, 64 + c)]);
+      const float bb1 = __bfloat162float(sm.dh_t[sw_off(r, 64 + c)]);
+      sm.t2[sw_off64(r, c)] = __float2bfloat16(kk0 * gg0 * bb0);  // kg*b, K-half 0
+      sm.t3[sw_off64(r, c)] = __float2bfloat16(kk1 * gg1 * bb1);  // kg*b, K-half 1
     }
     __syncthreads();
 
-    // dA += (-dwf) @ (kgb)^T : A-frags = dwf C-fragments (negated), B from t3.
+    // dA += (-dwf) @ (kgb)^T : A-frags = dwf C-fragments (negated), B from
+    // this half-warp's OWN K-half tile.
+    bf16* kgb_tile = hf ? sm.t3 : sm.t2;
     #pragma unroll
     for (int kc = 0; kc < kBV / 16; ++kc) {
       unsigned a_dwf[4];
@@ -407,7 +421,7 @@ gdn2_wy_dqkg_kernel(
         const int lrow = tcol + (lane & 7);
         const int lcol = kc * 16 + ((lane & 8) ? 8 : 0);
         unsigned bkgb[2];
-        ldmatrix_x2(bkgb, smem_u32(&sm.t3[sw_off64(lrow, lcol)]));
+        ldmatrix_x2(bkgb, smem_u32(&kgb_tile[sw_off64(lrow, lcol)]));
         mma_16x8x16(a_dwf, bkgb, &dA_acc[n * 4]);
       }
     }
@@ -906,17 +920,26 @@ gdn2_wy_intra_bwd_kernel(
 
   float dkgb[32];
   {
+    // kgb staging: two K-half tiles (t2 = lower, t3 = upper) so each
+    // half-warp's dA partial contracts its OWN dwf K-half against the same
+    // K-half of kgb. See the standalone kernel above for the full account
+    // of the writer-parity scramble this replaces (biased db/dg ->
+    // state-norm runaway in long runs).
     __syncthreads();
     for (int idx = threadIdx.x; idx < kBT * kBV; idx += kWarps * 32) {
       const int r = idx / kBV, c = idx % kBV;
-      const int gc = hf * 64 + c;
-      float kk = __bfloat162float(sm.h_t[sw_off(r, gc)]);
-      float bb = __bfloat162float(sm.dh_t[sw_off(r, gc)]);
-      float gg = (r < rows_here) ? exp2f(sm.u.gtile[r * kD + gc]) : 0.f;
-      sm.t3[sw_off64(r, c)] = __float2bfloat16(kk * gg * bb);  // kg*b
+      const float gg0 = (r < rows_here) ? exp2f(sm.u.gtile[r * kD + c]) : 0.f;
+      const float gg1 = (r < rows_here) ? exp2f(sm.u.gtile[r * kD + 64 + c]) : 0.f;
+      const float kk0 = __bfloat162float(sm.h_t[sw_off(r, c)]);
+      const float bb0 = __bfloat162float(sm.dh_t[sw_off(r, c)]);
+      const float kk1 = __bfloat162float(sm.h_t[sw_off(r, 64 + c)]);
+      const float bb1 = __bfloat162float(sm.dh_t[sw_off(r, 64 + c)]);
+      sm.t2[sw_off64(r, c)] = __float2bfloat16(kk0 * gg0 * bb0);  // kg*b half 0
+      sm.t3[sw_off64(r, c)] = __float2bfloat16(kk1 * gg1 * bb1);  // kg*b half 1
     }
     __syncthreads();
 
+    bf16* kgb_tile = hf ? sm.t3 : sm.t2;
     #pragma unroll
     for (int kc = 0; kc < kBV / 16; ++kc) {
       unsigned a_dwf[4];
@@ -930,7 +953,7 @@ gdn2_wy_intra_bwd_kernel(
         const int lrow = tcol + (lane & 7);
         const int lcol = kc * 16 + ((lane & 8) ? 8 : 0);
         unsigned bkgb[2];
-        ldmatrix_x2(bkgb, smem_u32(&sm.t3[sw_off64(lrow, lcol)]));
+        ldmatrix_x2(bkgb, smem_u32(&kgb_tile[sw_off64(lrow, lcol)]));
         mma_16x8x16(a_dwf, bkgb, &dA_acc[n * 4]);
       }
     }

@@ -1010,7 +1010,7 @@ def recompute_w_u_fwd_gdn2(
     # operand roundings and tensor-core dots as the Triton kernel, one CTA
     # per (chunk, head). Serves both the forward step-3 and the backward
     # recompute. Falls back to Triton for unsupported configurations.
-    if (os.environ.get("GDN2_FWD_IMPL", "cuda_fused").lower() == "cuda"
+    if (os.environ.get("GDN2_FWD_IMPL", "cuda_fused").lower() in ("cuda", "cuda_fused")
             and cu_seqlens is None and BT == 64 and K == 128 and V == 128
             and gk is not None and gk.dtype == torch.float32
             and gk.is_contiguous()
