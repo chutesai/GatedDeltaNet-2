@@ -1441,6 +1441,8 @@ struct FwdShared {
   float Traw[kBT * kBT];   // 16KB raw off-diag T (F1/F2) -> kb*2^g bf16 (F3)
   float Afull[kBT * kBT];  // 16KB (I+T)^{-1} (F1/F2)     -> v*wg  bf16 (F3)
   bf16 Abf[kBT * kBT];     //  8KB bf16 A (F3 mma; also the Akk store source)
+  bf16 rslab[8 * 256];     //  4KB per-warp B slabs (F1 mma; 6 off-diag + 2 diag)
+  float tstage[4 * 256];   //  4KB diag warps: masked T staging for the solve
 };
 
 __global__ void __launch_bounds__(kWarps * 32, 2)
@@ -1486,6 +1488,13 @@ gdn2_fwd_intra_fused_kernel(
   __syncthreads();
 
   // ================================ F1 ================================
+  // Scores on tensor cores. Off-diagonal warps build the decayed left
+  // operands (q*e, b*k*e) directly in mma A-fragments (pack_f2, same trick
+  // as the merged kernel's -dwf fragments) and stage the right operand
+  // k_j * 2^(gn_i - g_j) through a 512B per-warp smem slab. Diagonal warps
+  // do the same with the mid-anchor CLAMPED factors, apply the tril masks
+  // post-mma, and hand the masked T to the existing register-column
+  // substitution through a small fp32 stage.
   if (warp < 6) {
     // off-diagonal pair: (i, j), i > j
     const int OD_I[6] = {1, 2, 2, 3, 3, 3};
@@ -1493,159 +1502,201 @@ gdn2_fwd_intra_fused_kernel(
     const int bi = OD_I[warp], bj = OD_J[warp];
     if (bi * 16 < rows_here) {
       const int ri = min(16, rows_here - bi * 16);
-      const int t = lane >> 1;              // row within block i
-      const int j0 = bj * 16 + (lane & 1) * 8;  // first of 8 owned cols
-      const int trow = bi * 16 + t;
-      float acc_qk[8], acc_kk[8];
+      const int fr0 = lane >> 2;         // fragment row base (0..7)
+      const int fc0 = (lane & 3) * 2;    // fragment col base within a slab
+      bf16* rsl = &sm.rslab[warp * 256];
+      const long ganc = g0 + (long)(bi * 16) * hk;
+      float c_qk[8], c_kk[8];
       #pragma unroll
-      for (int e = 0; e < 8; ++e) { acc_qk[e] = acc_kk[e] = 0.f; }
-      const bool tv = t < ri;
-      const float* ganc = g + g0 + (long)(bi * 16) * hk;   // first-row anchor
-      const float* gown = g + g0 + (long)trow * hk;
-      for (int c8 = 0; c8 < kD; c8 += 8) {
-        float gn8[8], qe8[8], bke8[8];
-        {
-          const float4 a0 = __ldg(reinterpret_cast<const float4*>(ganc + c8));
-          const float4 a1 = __ldg(reinterpret_cast<const float4*>(ganc + c8 + 4));
-          gn8[0] = a0.x; gn8[1] = a0.y; gn8[2] = a0.z; gn8[3] = a0.w;
-          gn8[4] = a1.x; gn8[5] = a1.y; gn8[6] = a1.z; gn8[7] = a1.w;
-        }
-        {
-          float gt8[8];
-          if (tv) {
-            const float4 t0 = __ldg(reinterpret_cast<const float4*>(gown + c8));
-            const float4 t1 = __ldg(reinterpret_cast<const float4*>(gown + c8 + 4));
-            gt8[0] = t0.x; gt8[1] = t0.y; gt8[2] = t0.z; gt8[3] = t0.w;
-            gt8[4] = t1.x; gt8[5] = t1.y; gt8[6] = t1.z; gt8[7] = t1.w;
-          } else {
-            #pragma unroll
-            for (int cc = 0; cc < 8; ++cc) gt8[cc] = 0.f;
-          }
-          // own-row q/b/k from gmem; clamp the row when invalid (the loads
-          // must stay in-bounds — results are zeroed via ef anyway).
-          const int trs = tv ? trow : (bi * 16);
-          uint4 qraw = __ldg(reinterpret_cast<const uint4*>(rowp(q, trs, c8)));
-          uint4 braw = __ldg(reinterpret_cast<const uint4*>(rowp(b, trs, c8)));
-          uint4 kraw = __ldg(reinterpret_cast<const uint4*>(rowp(k, trs, c8)));
-          const bf16* qv8 = reinterpret_cast<const bf16*>(&qraw);
-          const bf16* bv8 = reinterpret_cast<const bf16*>(&braw);
-          const bf16* kv8 = reinterpret_cast<const bf16*>(&kraw);
-          #pragma unroll
-          for (int cc = 0; cc < 8; ++cc) {
-            const float ef = tv ? exp2f(gt8[cc] - gn8[cc]) : 0.f;   // <= 1
-            qe8[cc] = __bfloat162float(qv8[cc]) * ef;
-            bke8[cc] = __bfloat162float(bv8[cc])
-                       * __bfloat162float(kv8[cc]) * ef;
-          }
-        }
+      for (int i = 0; i < 8; ++i) { c_qk[i] = c_kk[i] = 0.f; }
+      for (int kc = 0; kc < 8; ++kc) {
+        const int cbase = kc * 16;
+        unsigned a_q[4], a_bk[4];
         #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-          const int jrow = j0 + e;
-          const float* gj = g + g0 + (long)jrow * hk;
-          const float4 j0f = __ldg(reinterpret_cast<const float4*>(gj + c8));
-          const float4 j1f = __ldg(reinterpret_cast<const float4*>(gj + c8 + 4));
-          float gj8[8];
-          gj8[0] = j0f.x; gj8[1] = j0f.y; gj8[2] = j0f.z; gj8[3] = j0f.w;
-          gj8[4] = j1f.x; gj8[5] = j1f.y; gj8[6] = j1f.z; gj8[7] = j1f.w;
-          uint4 kjraw = __ldg(reinterpret_cast<const uint4*>(rowp(k, jrow, c8)));
-          const bf16* kj8 = reinterpret_cast<const bf16*>(&kjraw);
+        for (int half = 0; half < 2; ++half) {
+          const int rloc = fr0 + half * 8;
+          const bool rv = rloc < ri;
+          const int rc = bi * 16 + (rv ? rloc : 0);
           #pragma unroll
-          for (int cc = 0; cc < 8; ++cc) {
-            const float f = __bfloat162float(kj8[cc])
-                            * exp2f(gn8[cc] - gj8[cc]);   // <= 1
-            acc_qk[e] += qe8[cc] * f;
-            acc_kk[e] += bke8[cc] * f;
+          for (int ch = 0; ch < 2; ++ch) {
+            const int c = cbase + fc0 + ch * 8;
+            const unsigned qp = __ldg(reinterpret_cast<const unsigned*>(rowp(q, rc, c)));
+            const unsigned bp = __ldg(reinterpret_cast<const unsigned*>(rowp(b, rc, c)));
+            const unsigned kp = __ldg(reinterpret_cast<const unsigned*>(rowp(k, rc, c)));
+            const float2 gp = __ldg(reinterpret_cast<const float2*>(g + g0 + (long)rc * hk + c));
+            const float2 gn = __ldg(reinterpret_cast<const float2*>(g + ganc + c));
+            const bf16* q2 = reinterpret_cast<const bf16*>(&qp);
+            const bf16* b2 = reinterpret_cast<const bf16*>(&bp);
+            const bf16* k2 = reinterpret_cast<const bf16*>(&kp);
+            const float e0 = rv ? exp2f(gp.x - gn.x) : 0.f;   // <= 1
+            const float e1 = rv ? exp2f(gp.y - gn.y) : 0.f;
+            a_q[half + ch * 2] = pack_f2(__bfloat162float(q2[0]) * e0,
+                                         __bfloat162float(q2[1]) * e1);
+            a_bk[half + ch * 2] =
+                pack_f2(__bfloat162float(b2[0]) * __bfloat162float(k2[0]) * e0,
+                        __bfloat162float(b2[1]) * __bfloat162float(k2[1]) * e1);
           }
         }
-      }
-      if (tv) {
-        const long orow = ((bos + t_lo + trow) * H + i_h) * (long)kBT;
+        // right-operand slab: R[j, c] = k_j * 2^(gn_i - g_j), both <= 1.
         #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-          Aqk_o[orow + j0 + e] = __float2bfloat16(acc_qk[e] * scale);
-          sm.Traw[trow * kBT + j0 + e] = acc_kk[e];
+        for (int u = 0; u < 8; ++u) {
+          const int idx = lane * 8 + u;
+          const int jj = idx >> 4, cc = idx & 15;
+          const int jrow = bj * 16 + jj;
+          const int c = cbase + cc;
+          const float gj = __ldg(g + g0 + (long)jrow * hk + c);
+          const float gnv = __ldg(g + ganc + c);
+          const float kv = __bfloat162float(__ldg(rowp(k, jrow, c)));
+          rsl[jj * 16 + cc] = __float2bfloat16(kv * exp2f(gnv - gj));
         }
+        __syncwarp();
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+          unsigned bfr[2];
+          ldmatrix_x2(bfr, smem_u32(&rsl[(n * 8 + (lane & 7)) * 16
+                                         + ((lane & 8) ? 8 : 0)]));
+          mma_16x8x16(a_q, bfr, &c_qk[n * 4]);
+          mma_16x8x16(a_bk, bfr, &c_kk[n * 4]);
+        }
+        __syncwarp();
       }
+      #pragma unroll
+      for (int n = 0; n < 2; ++n)
+        #pragma unroll
+        for (int half = 0; half < 2; ++half)
+          #pragma unroll
+          for (int e = 0; e < 2; ++e) {
+            const int i = n * 4 + half * 2 + e;
+            const int rloc = fr0 + half * 8;
+            if (rloc < ri) {
+              const int trow = bi * 16 + rloc;
+              const int col = bj * 16 + n * 8 + fc0 + e;
+              Aqk_o[((bos + t_lo + trow) * H + i_h) * (long)kBT + col] =
+                  __float2bfloat16(c_qk[i] * scale);
+              sm.Traw[trow * kBT + col] = c_kk[i];
+            }
+          }
     }
   } else {
     // diagonal blocks: warp 6 -> blocks 0,1 ; warp 7 -> blocks 2,3.
-    // Half-warp per block; lane-in-half n owns COLUMN n.
-    const int d = (warp - 6) * 2 + (lane >> 4);
-    const int n = lane & 15;
-    const unsigned hmask = (lane < 16) ? 0x0000ffffu : 0xffff0000u;
-    float Tcol[16], Aqkcol[16];
+    // Full-warp mma per block (sequential), then the existing half-warp
+    // column-register substitution, fed through a masked fp32 stage.
+    const int dw = warp - 6;
+    float* tst = &sm.tstage[dw * 512];             // 2 blocks x 256 floats
+    bf16* rsl = &sm.rslab[(6 + dw) * 256];         // own B-slab slot
+    const int fr0 = lane >> 2;
+    const int fc0 = (lane & 3) * 2;
     #pragma unroll
-    for (int m = 0; m < 16; ++m) { Tcol[m] = Aqkcol[m] = 0.f; }
-    const int rd = min(16, rows_here - d * 16);   // valid rows (may be <=0)
-    if (rd > 0) {
-      const int anchor = d * 16 + min(8, rows_here - d * 16 - 1);
-      const int ncol = d * 16 + n;                 // absolute column row-index
-      const bool nv = n < rd;
-      const int nrow = nv ? ncol : (d * 16);      // clamped in-bounds row
-      const float* ganc = g + g0 + (long)anchor * hk;
-      const float* gnrw = g + g0 + (long)nrow * hk;
-      for (int c8 = 0; c8 < kD; c8 += 8) {
-        float gn8[8], gr8[8], qe8[8], bke8[8], f8[8];
-        {
-          const float4 a0 = __ldg(reinterpret_cast<const float4*>(ganc + c8));
-          const float4 a1 = __ldg(reinterpret_cast<const float4*>(ganc + c8 + 4));
-          gn8[0] = a0.x; gn8[1] = a0.y; gn8[2] = a0.z; gn8[3] = a0.w;
-          gn8[4] = a1.x; gn8[5] = a1.y; gn8[6] = a1.z; gn8[7] = a1.w;
-          const float4 r0 = __ldg(reinterpret_cast<const float4*>(gnrw + c8));
-          const float4 r1 = __ldg(reinterpret_cast<const float4*>(gnrw + c8 + 4));
-          gr8[0] = r0.x; gr8[1] = r0.y; gr8[2] = r0.z; gr8[3] = r0.w;
-          gr8[4] = r1.x; gr8[5] = r1.y; gr8[6] = r1.z; gr8[7] = r1.w;
-        }
-        const uint4 qraw = __ldg(reinterpret_cast<const uint4*>(rowp(q, nrow, c8)));
-        const uint4 braw = __ldg(reinterpret_cast<const uint4*>(rowp(b, nrow, c8)));
-        const uint4 kraw = __ldg(reinterpret_cast<const uint4*>(rowp(k, nrow, c8)));
-        const bf16* qp = reinterpret_cast<const bf16*>(&qraw);
-        const bf16* bp = reinterpret_cast<const bf16*>(&braw);
-        const bf16* kp = reinterpret_cast<const bf16*>(&kraw);
-        #pragma unroll
-        for (int cc = 0; cc < 8; ++cc) {
-          const float e_own = nv ? exp2f(fminf(gr8[cc] - gn8[cc], 110.f)) : 0.f;
-          qe8[cc] = __bfloat162float(qp[cc]) * e_own;
-          bke8[cc] = __bfloat162float(bp[cc]) * __bfloat162float(kp[cc]) * e_own;
-          f8[cc] = nv ? __bfloat162float(kp[cc])
-                        * exp2f(fminf(gn8[cc] - gr8[cc], 110.f))
-                      : 0.f;
-        }
-        #pragma unroll
-        for (int m = 0; m < 16; ++m) {
+    for (int blk = 0; blk < 2; ++blk) {
+      const int d = dw * 2 + blk;
+      const int rd = min(16, rows_here - d * 16);
+      float c_qk[8], c_kk[8];
+      #pragma unroll
+      for (int i = 0; i < 8; ++i) { c_qk[i] = c_kk[i] = 0.f; }
+      if (rd > 0) {
+        const int anchor = d * 16 + min(8, rows_here - d * 16 - 1);
+        const long ganc = g0 + (long)anchor * hk;
+        for (int kc = 0; kc < 8; ++kc) {
+          const int cbase = kc * 16;
+          unsigned a_q[4], a_bk[4];
           #pragma unroll
-          for (int cc = 0; cc < 8; ++cc) {
-            const float qm = __shfl_sync(hmask, qe8[cc], m, 16);
-            const float bkm = __shfl_sync(hmask, bke8[cc], m, 16);
-            Aqkcol[m] += qm * f8[cc];
-            Tcol[m] += bkm * f8[cc];
+          for (int half = 0; half < 2; ++half) {
+            const int rloc = fr0 + half * 8;
+            const bool rv = rloc < rd;
+            const int rc = d * 16 + (rv ? rloc : 0);
+            #pragma unroll
+            for (int ch = 0; ch < 2; ++ch) {
+              const int c = cbase + fc0 + ch * 8;
+              const unsigned qp = __ldg(reinterpret_cast<const unsigned*>(rowp(q, rc, c)));
+              const unsigned bp = __ldg(reinterpret_cast<const unsigned*>(rowp(b, rc, c)));
+              const unsigned kp = __ldg(reinterpret_cast<const unsigned*>(rowp(k, rc, c)));
+              const float2 gp = __ldg(reinterpret_cast<const float2*>(g + g0 + (long)rc * hk + c));
+              const float2 gn = __ldg(reinterpret_cast<const float2*>(g + ganc + c));
+              const bf16* q2 = reinterpret_cast<const bf16*>(&qp);
+              const bf16* b2 = reinterpret_cast<const bf16*>(&bp);
+              const bf16* k2 = reinterpret_cast<const bf16*>(&kp);
+              const float e0 = rv ? exp2f(fminf(gp.x - gn.x, 110.f)) : 0.f;
+              const float e1 = rv ? exp2f(fminf(gp.y - gn.y, 110.f)) : 0.f;
+              a_q[half + ch * 2] = pack_f2(__bfloat162float(q2[0]) * e0,
+                                           __bfloat162float(q2[1]) * e1);
+              a_bk[half + ch * 2] =
+                  pack_f2(__bfloat162float(b2[0]) * __bfloat162float(k2[0]) * e0,
+                          __bfloat162float(b2[1]) * __bfloat162float(k2[1]) * e1);
+            }
           }
+          #pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            const int idx = lane * 8 + u;
+            const int jj = idx >> 4, cc = idx & 15;
+            const bool jv = jj < rd;
+            const int jrow = d * 16 + (jv ? jj : 0);
+            const int c = cbase + cc;
+            const float gj = __ldg(g + g0 + (long)jrow * hk + c);
+            const float gnv = __ldg(g + ganc + c);
+            const float kv = __bfloat162float(__ldg(rowp(k, jrow, c)));
+            rsl[jj * 16 + cc] = __float2bfloat16(
+                jv ? kv * exp2f(fminf(gnv - gj, 110.f)) : 0.f);
+          }
+          __syncwarp();
+          #pragma unroll
+          for (int n = 0; n < 2; ++n) {
+            unsigned bfr[2];
+            ldmatrix_x2(bfr, smem_u32(&rsl[(n * 8 + (lane & 7)) * 16
+                                           + ((lane & 8) ? 8 : 0)]));
+            mma_16x8x16(a_q, bfr, &c_qk[n * 4]);
+            mma_16x8x16(a_bk, bfr, &c_kk[n * 4]);
+          }
+          __syncwarp();
         }
+        // Aqk diagonal block: full rows < rd, zeros above the inclusive
+        // diagonal (downstream dots rely on the zeros).
+        #pragma unroll
+        for (int n = 0; n < 2; ++n)
+          #pragma unroll
+          for (int half = 0; half < 2; ++half)
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+              const int i = n * 4 + half * 2 + e;
+              const int rloc = fr0 + half * 8;
+              const int cloc = n * 8 + fc0 + e;
+              if (rloc < rd) {
+                Aqk_o[((bos + t_lo + d * 16 + rloc) * H + i_h) * (long)kBT
+                      + d * 16 + cloc] =
+                    __float2bfloat16((rloc >= cloc) ? c_qk[i] * scale : 0.f);
+              }
+            }
       }
-      // store the FULL Aqk diagonal block for valid rows, with explicit
-      // zeros above the (inclusive) diagonal — downstream dots rely on the
-      // zeros, exactly like the Triton sub-chunk kernel's masked store.
+      // masked strict-lower T into the fp32 stage (zeros elsewhere).
+      __syncwarp();
       #pragma unroll
-      for (int m = 0; m < 16; ++m) {
-        if (m < rd) {
-          Aqk_o[((bos + t_lo + d * 16 + m) * H + i_h) * (long)kBT + d * 16 + n] =
-              __float2bfloat16((m >= n) ? Aqkcol[m] * scale : 0.f);
-        }
-      }
-      // T strict lower for the inversion
-      #pragma unroll
-      for (int m = 0; m < 16; ++m)
-        if (m <= n || m >= rd) Tcol[m] = 0.f;
+      for (int n = 0; n < 2; ++n)
+        #pragma unroll
+        for (int half = 0; half < 2; ++half)
+          #pragma unroll
+          for (int e = 0; e < 2; ++e) {
+            const int i = n * 4 + half * 2 + e;
+            const int rloc = fr0 + half * 8;
+            const int cloc = n * 8 + fc0 + e;
+            const bool keep = (rloc > cloc) && (rloc < rd);
+            tst[blk * 256 + rloc * 16 + cloc] = keep ? c_kk[i] : 0.f;
+          }
+      __syncwarp();
     }
-    // forward substitution: Ai = (I + T)^{-1}, unit lower triangular.
+    // existing substitution, per half-warp block, columns from the stage.
+    const int n = lane & 15;
+    const int blk = lane >> 4;
+    const int d = dw * 2 + blk;
+    const int rd = min(16, rows_here - d * 16);
+    const unsigned hmask = (lane < 16) ? 0x0000ffffu : 0xffff0000u;
+    float Tcol[16];
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) Tcol[m] = tst[blk * 256 + m * 16 + n];
     float Aicol[16];
     #pragma unroll
     for (int m = 0; m < 16; ++m) Aicol[m] = -Tcol[m];
     const int bound = max(rd, 0);
     #pragma unroll
     for (int i = 2; i < 16; ++i) {
-      // row i of the running inverse: a_n = -T[i, n] (n < i), then
-      // a += a @ Ai (rows < i), done column-wise per lane.
       float a_n = (n < i) ? -Tcol[i] : 0.f;
       float upd = 0.f;
       #pragma unroll
@@ -1655,7 +1706,6 @@ gdn2_fwd_intra_fused_kernel(
       }
       if (i < bound) Aicol[i] = a_n + upd;
     }
-    // add identity and write the block column into Afull
     #pragma unroll
     for (int m = 0; m < 16; ++m) {
       float val = Aicol[m] + ((m == n) ? 1.f : 0.f);

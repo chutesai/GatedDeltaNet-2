@@ -866,7 +866,7 @@ def chunk_gdn2_fwd_intra(
     # class as the merged backward kernel). Falls back to the Triton
     # pipeline for exact-intra mode, safe_gate, varlen, or K/V != 128.
     import os as _os
-    if (_os.environ.get("GDN2_FWD_IMPL", "triton").lower() == "cuda_fused"
+    if (_os.environ.get("GDN2_FWD_IMPL", "cuda_fused").lower() == "cuda_fused"
             and _os.environ.get("GDN2_EXACT_INTRA", "0") != "1"
             and not safe_gate and cu_seqlens is None
             and BT == 64 and K == 128 and v.shape[-1] == 128
@@ -1010,8 +1010,7 @@ def recompute_w_u_fwd_gdn2(
     # operand roundings and tensor-core dots as the Triton kernel, one CTA
     # per (chunk, head). Serves both the forward step-3 and the backward
     # recompute. Falls back to Triton for unsupported configurations.
-    if (os.environ.get("GDN2_FWD_IMPL", "triton").lower()
-            in ("cuda", "cuda_fused")
+    if (os.environ.get("GDN2_FWD_IMPL", "cuda_fused").lower() == "cuda"
             and cu_seqlens is None and BT == 64 and K == 128 and V == 128
             and gk is not None and gk.dtype == torch.float32
             and gk.is_contiguous()
@@ -1139,6 +1138,10 @@ def chunk_gdn2_fwd(
     else:
         fuse_o = _fuse_env == "1"
     if fuse_o:
+        # With o fused and recompute on, the per-chunk states and v_new are
+        # dropped right after this call (the backward re-materializes them),
+        # so their stores are pure write traffic — skip them.
+        _drop_hv = disable_recompute is False and not return_intermediate_states
         h, v_new, final_state, o = chunk_gated_delta_rule_fwd_h(
             k=kg,
             w=w,
@@ -1149,6 +1152,8 @@ def chunk_gdn2_fwd(
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
+            save_new_value=not _drop_hv,
+            store_h=not _drop_hv,
             cu_seqlens=cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
             chunk_indices=chunk_indices,
