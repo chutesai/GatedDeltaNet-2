@@ -2546,9 +2546,11 @@ def kda_gate_bwd(
         lower_bound=lower_bound,
     )
 
+    # dbias sums over every token: reduce in the kernel's fp32 before the
+    # per-token grads are rounded to g's dtype (bf16) below.
+    dbias = dg.view(-1, H * K).sum(0).to(dt_bias) if dt_bias is not None else None
     dg = dg.view_as(g).type_as(g)
     dA = dA.sum(0).view_as(A_log).type_as(A_log)
-    dbias = dg.view(-1, H * K).sum(0).to(dt_bias) if dt_bias is not None else None
 
     return dg, dA, dbias
 
@@ -3714,7 +3716,8 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         chunk_indices=chunk_indices,
-        state_v_first=transpose_state_layout,
+        use_exp2=True,
+        transpose_state_layout=transpose_state_layout,
     )
 
     if cp_context is not None:
@@ -4250,7 +4253,8 @@ def chunk_kda_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        state_v_first=transpose_state_layout,
+        use_exp2=True,
+        transpose_state_layout=transpose_state_layout,
     )
 
     dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(

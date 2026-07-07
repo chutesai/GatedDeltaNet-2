@@ -105,6 +105,16 @@ struct SharedStorage {
   } u;
 };
 
+// P4 stages q across A||At and b across t2||t3 as single contiguous
+// 64x128 bf16 buffers (sw_off uses 128-element rows); the pairs must stay
+// adjacent with no padding or the staged operands silently scramble.
+static_assert(offsetof(SharedStorage, At) ==
+              offsetof(SharedStorage, A) + sizeof(bf16) * kBT * kBT,
+              "A||At must be contiguous for P4 q staging");
+static_assert(offsetof(SharedStorage, t3) ==
+              offsetof(SharedStorage, t2) + sizeof(bf16) * kBT * kBV,
+              "t2||t3 must be contiguous for P4 b staging");
+
 __global__ void __launch_bounds__(kWarps * 32, 1)
 gdn2_wy_dqkg_kernel(
     const bf16* __restrict__ q,
@@ -1280,8 +1290,12 @@ gdn2_wy_intra_bwd_kernel(
       }
       #pragma unroll
       for (int t = 0; t < 16; ++t) {
-        const float s0 = exp2f(g_own[t * 2 + 0] - gn0);
-        const float s1 = exp2f(g_own[t * 2 + 1] - gn1);
+        // Dead tail lanes (t >= jmax) carry g_own = 0, so exp2f(-gn0) can be
+        // +inf under strong decay and 0*inf would park NaN in dq2/dk2. The
+        // stores are jmax-guarded today, but keep the registers finite.
+        const bool live = t < jmax;
+        const float s0 = live ? exp2f(g_own[t * 2 + 0] - gn0) : 0.f;
+        const float s1 = live ? exp2f(g_own[t * 2 + 1] - gn1) : 0.f;
         dq2[t * 2 + 0] *= s0;
         dq2[t * 2 + 1] *= s1;
         dk2[t * 2 + 0] *= s0;
@@ -1795,14 +1809,15 @@ gdn2_fwd_intra_fused_kernel(
         s_col[m] = s;
       }
       float y[16];
+      // Y = -Ai_ii @ S. Unlike level 1 (X row spread across lanes), S here is
+      // the RIGHT operand and S[p][n] is this lane's own s_col[p] — a shuffle
+      // of s_col[m] from lane p would fetch S[m][p] and contract row-with-row.
       #pragma unroll
       for (int m = 0; m < 16; ++m) {
         float s = 0.f;
         #pragma unroll
-        for (int p = 0; p < 16; ++p) {
-          const float smp = __shfl_sync(0x0000ffffu, s_col[m], p, 16);
-          s += sm.Afull[(i * 16 + m) * kBT + i * 16 + p] * smp;
-        }
+        for (int p = 0; p < 16; ++p)
+          s += sm.Afull[(i * 16 + m) * kBT + i * 16 + p] * s_col[p];
         y[m] = -s;
       }
       #pragma unroll
@@ -1828,14 +1843,14 @@ gdn2_fwd_intra_fused_kernel(
         s_col[m] = s;
       }
       float y[16];
+      // Same as level 2: S is the right operand, S[p][n] = lane-local
+      // s_col[p]; no shuffle.
       #pragma unroll
       for (int m = 0; m < 16; ++m) {
         float s = 0.f;
         #pragma unroll
-        for (int p = 0; p < 16; ++p) {
-          const float smp = __shfl_sync(0x0000ffffu, s_col[m], p, 16);
-          s += sm.Afull[(48 + m) * kBT + 48 + p] * smp;
-        }
+        for (int p = 0; p < 16; ++p)
+          s += sm.Afull[(48 + m) * kBT + 48 + p] * s_col[p];
         y[m] = -s;
       }
       #pragma unroll

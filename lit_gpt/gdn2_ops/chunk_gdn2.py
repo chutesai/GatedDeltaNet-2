@@ -870,6 +870,7 @@ def chunk_gdn2_fwd_intra(
             and _os.environ.get("GDN2_EXACT_INTRA", "0") != "1"
             and not safe_gate and cu_seqlens is None
             and BT == 64 and K == 128 and v.shape[-1] == 128
+            and B * H <= 65535  # grid is dim3(NT, B*H); y capped at 65535
             and q.is_cuda and torch.cuda.get_device_capability(q.device) == (12, 0)
             and all(t.dtype == torch.bfloat16 and t.is_contiguous()
                     for t in (q, k, v, b, wg))
@@ -1012,6 +1013,7 @@ def recompute_w_u_fwd_gdn2(
     # recompute. Falls back to Triton for unsupported configurations.
     if (os.environ.get("GDN2_FWD_IMPL", "cuda_fused").lower() in ("cuda", "cuda_fused")
             and cu_seqlens is None and BT == 64 and K == 128 and V == 128
+            and k.shape[0] * k.shape[2] <= 65535  # dim3(NT, B*H) grid-y cap
             and gk is not None and gk.dtype == torch.float32
             and gk.is_contiguous()
             and k.is_cuda and torch.cuda.get_device_capability(k.device) == (12, 0)
@@ -1538,7 +1540,7 @@ def chunk_gdn2_bwd_kernel_wy_dqkg_fused(
 
                 tl.store(p_dv2, b_dv2.to(p_dv2.dtype.element_ty), boundary_check=(0, 1))
                 _store_sr_bf16(p_dw_gate, b_dw_gate, sr_seed,
-                               (i_bh * tl.num_programs(0) + i_t) * 2 + i_v, USE_SR)
+                               (i_bh * tl.num_programs(0) + i_t) * tl.cdiv(V, BV) + i_v, USE_SR)
 
         b_gk_exp = exp2(b_g)
         b_gb = b_gk_exp * b_b
@@ -1923,6 +1925,8 @@ def _wy_cuda_supported(q, k, v, v_new, g, b, wg, A, h, do, dh, dv, scale,
         return False
     if chunk_size != 64 or k.shape[-1] != 128 or v.shape[-1] != 128:
         return False
+    if q.shape[0] * q.shape[2] > 65535:
+        return False  # kernel grid is dim3(NT, B*H); y is capped at 65535
     if os.environ.get("GDN2_GRAD_STORE_DTYPE", "fp32") == "bf16sr":
         return False  # stochastic-rounding dw stores are Triton-only
     if not q.is_cuda or torch.cuda.get_device_capability(q.device) != (12, 0):

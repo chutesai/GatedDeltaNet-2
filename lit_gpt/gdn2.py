@@ -290,7 +290,13 @@ class GatedDeltaNet2(nn.Module):
         # no fp32 torch chain, nothing extra saved for backward.
         # GDN2_GATE_IN_KERNEL=0 restores the torch-side chain.
         _gate_in_kernel = (
-            os.environ.get("GDN2_GATE_IN_KERNEL", "1") == "1" and mode == "chunk"
+            os.environ.get("GDN2_GATE_IN_KERNEL", "1") == "1"
+            and mode == "chunk"
+            # The in-kernel gate indexes A_log/dt_bias with the post-repeat
+            # head index; under GVA (num_v_heads > num_heads) that reads out
+            # of bounds fwd and breaks the dA view in bwd — use the torch
+            # chain there.
+            and self.num_v_heads == self.num_heads
         )
         if _fused_proj:
             w_cat = torch.cat(
