@@ -39,7 +39,7 @@ from torch.nn import functional as F
 from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, pad_input, update_layer_cache
 from fla.modules import FusedRMSNormSwishGate, ShortConvolution
 
-from .gdn2_ops.chunk_gdn2 import chunk_gdn2
+from .gdn2_ops.chunk_gdn2 import chunk_gdn2, gdn2_telemetry_snapshot  # noqa: F401 -- snapshot re-exported for trainers
 from .gdn2_ops.fused_recurrent_gdn2 import fused_recurrent_gdn2
 
 if TYPE_CHECKING:
@@ -289,9 +289,17 @@ class GatedDeltaNet2(nn.Module):
         # run fused with the chunk cumsum inside the kernel: identical math,
         # no fp32 torch chain, nothing extra saved for backward.
         # GDN2_GATE_IN_KERNEL=0 restores the torch-side chain.
+        # GDN2_GATE_MIN_DECAY=eps floors softplus(f + dt_bias) at eps — a
+        # minimum per-token forgetting rate (Mamba-style dt floor). Every
+        # channel becomes a strict contraction, so the state is bounded by a
+        # geometric sum instead of integrating across the window. The fused
+        # gate kernel has no eps support; a nonzero floor routes through the
+        # torch chain below (same math the kernel was verified equivalent to).
+        _gate_eps = float(os.environ.get("GDN2_GATE_MIN_DECAY", "0") or 0)
         _gate_in_kernel = (
             os.environ.get("GDN2_GATE_IN_KERNEL", "1") == "1"
             and mode == "chunk"
+            and _gate_eps == 0.0
             # The in-kernel gate indexes A_log/dt_bias with the post-repeat
             # head index; under GVA (num_v_heads > num_heads) that reads out
             # of bounds fwd and breaks the dA view in bwd — use the torch
@@ -366,7 +374,7 @@ class GatedDeltaNet2(nn.Module):
         else:
             g = (
                 -self.A_log.float().exp().repeat_interleave(self.head_k_dim)
-                * F.softplus(f_pre.float() + self.dt_bias)
+                * (F.softplus(f_pre.float() + self.dt_bias) + _gate_eps)
             )
 
         # GDN-2 gates, both squashed to [0, 1] by a sigmoid. b is the
@@ -393,7 +401,14 @@ class GatedDeltaNet2(nn.Module):
         # Optionally lift the erase gate from [0, 1] into [0, 2], which allows
         # negative eigenvalues in the state transition (extra state-tracking
         # capacity). The write gate w is left in [0, 1].
-        if self.allow_neg_eigval:
+        # GDN2_BETA_MAX overrides the ceiling: beta in (0, BETA_MAX). At
+        # beta -> 2 the delta update is norm-PRESERVING in the written
+        # direction — a marginally stable mode resonant data can pump; 1.0
+        # restores a strictly contractive erase.
+        _beta_max = float(os.environ.get("GDN2_BETA_MAX", "0") or 0)
+        if _beta_max > 0:
+            b = b * _beta_max
+        elif self.allow_neg_eigval:
             b = b * 2.0
 
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None

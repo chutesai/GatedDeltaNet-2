@@ -84,12 +84,114 @@ NUM_WARPS_INTRA = [1, 2, 4] if IS_NVIDIA_HOPPER else [1, 2, 4, 8]
 NUM_WARPS_GENERIC = [1, 2, 4] if IS_NVIDIA_HOPPER else [1, 2, 4, 8]
 
 from .chunk_kda import (
-    chunk_gated_delta_rule_fwd_h,    
-    chunk_gated_delta_rule_bwd_dhu,  
-    chunk_kda_bwd_dAv,               
-    kda_gate_chunk_cumsum,           
-    kda_gate_bwd,                    
+    chunk_gated_delta_rule_fwd_h,
+    chunk_gated_delta_rule_bwd_dhu,
+    chunk_kda_bwd_dAv,
+    kda_gate_chunk_cumsum,
+    kda_gate_bwd,
 )
+
+
+# =============================================================================
+# TELEMETRY + GATE-RANGE GUARD
+# -----------------------------------------------------------------------------
+# GDN2_TELEMETRY=1        collect running maxima of the integrator observables
+#                         (gate ranges, state/output amax) as 0-dim GPU
+#                         tensors — no per-step sync; the trainer reads them
+#                         via gdn2_telemetry_snapshot(). Forces the h store in
+#                         the fused-o arm (~one extra tensor write per layer).
+# GDN2_GATE_RANGE_GUARD=1 per-call guard: when the anchored kernels' clamp
+#                         ENGAGEMENT RATE (fraction of (sub-chunk, channel)
+#                         cells whose mid-anchor exp2 operand exceeds the 110
+#                         clamp) rises past GDN2_GATE_CLAMP_FRAC_MAX (default
+#                         0.1 — CALIBRATE against a healthy-run telemetry
+#                         baseline before enabling; instant-forget channels
+#                         put the baseline above zero from step 0), route
+#                         THAT call through the exact token-parallel intra.
+#                         GDN2_GATE_ARG_MAX optionally adds an absolute
+#                         trigger on the exact anchored operand (off unless
+#                         set). Costs one device sync per call; dense
+#                         (cu_seqlens=None) only.
+# =============================================================================
+_TELEMETRY_STATS: dict[str, torch.Tensor] = {}
+_TELEMETRY_COUNTS: dict[str, int] = {}
+_GUARD_WARNED = False
+
+
+def _telemetry_enabled() -> bool:
+    return os.environ.get("GDN2_TELEMETRY", "0") == "1"
+
+
+def _telemetry_max(name: str, value: torch.Tensor) -> None:
+    value = value.detach()
+    prev = _TELEMETRY_STATS.get(name)
+    _TELEMETRY_STATS[name] = value if prev is None else torch.maximum(prev, value)
+
+
+def _telemetry_count(name: str) -> None:
+    _TELEMETRY_COUNTS[name] = _TELEMETRY_COUNTS.get(name, 0) + 1
+
+
+def gdn2_telemetry_snapshot(reset: bool = True) -> dict:
+    """Running maxima/counters since the last snapshot (syncs once per call).
+
+    Keys: gate_subchunk_range_max (full 16-token log2 drop — loose bound,
+    kept for gateprobe cross-checks), gate_anchor_arg_max (exact max
+    mid-anchor exp2 operand the anchored kernels clamp at 110 —
+    init-dominated, telemetry not trigger), gate_clamp_frac (fraction of
+    (sub-chunk, channel) cells past the clamp — the guard's trigger
+    quantity; watch its baseline vs its march), gate_chunk_drop_max (log2
+    drop over a full chunk — the gate march rate), state_amax (|h| max),
+    o_amax (recurrence output pre-norm), gate_guard_triggers (count of
+    exact-intra fallbacks).
+    """
+    out = {name: float(t) for name, t in _TELEMETRY_STATS.items()}
+    out.update(_TELEMETRY_COUNTS)
+    if reset:
+        _TELEMETRY_STATS.clear()
+        _TELEMETRY_COUNTS.clear()
+    return out
+
+
+# The anchored kernels clamp their exp2 operands here (see the Triton
+# sub-chunk kernel and the CUDA F1 diagonal warps).
+_ANCHOR_CLAMP = 110.0
+
+
+def _gate_range_stats(
+    gk: torch.Tensor, sub_chunk_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-call gate statistics from the chunk-local log2 cumsum, as 0-dim
+    GPU tensors (no sync):
+
+    - range_max: max full sub-chunk drop (loose upper bound; kept for
+      continuity with the wrapper-side gateprobe cross-check).
+    - arg_max: max mid-anchor half-range — EXACTLY the largest operand the
+      anchored kernels feed exp2 before the 110 clamp. Init-dominated:
+      instant-forget channels legitimately exceed the clamp forever, and
+      clamping them is near-harmless (their pair values underflow to ~0
+      either way), so this is telemetry, not a good trigger.
+    - clamp_frac: fraction of (window, channel) cells whose max anchored
+      operand exceeds the clamp — the engagement RATE. A marching regime
+      raises the bulk, so this is the guard's trigger quantity; calibrate
+      the threshold against a healthy-run baseline from telemetry.
+    """
+    T = gk.shape[1]
+    Tp = T - (T % sub_chunk_size)
+    if Tp == 0:
+        z = gk.new_zeros(())
+        return z, z, z
+    g = gk[:, :Tp].detach().reshape(
+        gk.shape[0], Tp // sub_chunk_size, sub_chunk_size, *gk.shape[2:]
+    )
+    a = sub_chunk_size // 2  # mid-anchor row (min(BC//2, rows-1) in-kernel)
+    # Non-increasing within a chunk, so start-minus-end is the drop; windows
+    # straddling a varlen chunk reset go negative and drop out of the maxima.
+    up = g[:, :, 0] - g[:, :, a]    # rows above the anchor: +arg side
+    dn = g[:, :, a] - g[:, :, -1]   # rows below the anchor: -arg side
+    arg = torch.maximum(up, dn)
+    range_max = (g[:, :, 0] - g[:, :, -1]).amax()
+    return range_max, arg.amax(), (arg > _ANCHOR_CLAMP).float().mean()
 
 # =============================================================================
 # FORWARD KERNELS
@@ -866,8 +968,50 @@ def chunk_gdn2_fwd_intra(
     # class as the merged backward kernel). Falls back to the Triton
     # pipeline for exact-intra mode, safe_gate, varlen, or K/V != 128.
     import os as _os
+    # Exact-intra dispatch: env-forced (GDN2_EXACT_INTRA=1), or per-call via
+    # the gate-range guard when a sub-chunk's log2 decay range approaches the
+    # clamp the anchored kernels (Triton sub-chunk AND fused CUDA) share —
+    # they are exact only below it.
+    exact_intra = _os.environ.get("GDN2_EXACT_INTRA", "0") == "1" and not safe_gate
+    guard_on = (
+        _os.environ.get("GDN2_GATE_RANGE_GUARD", "0") == "1"
+        and not exact_intra and not safe_gate and cu_seqlens is None
+    )
+    if guard_on or _telemetry_enabled():
+        gate_range, anchor_arg, clamp_frac = _gate_range_stats(gk, BC)
+        if _telemetry_enabled():
+            _telemetry_max("gate_subchunk_range_max", gate_range)
+            _telemetry_max("gate_anchor_arg_max", anchor_arg)
+            _telemetry_max("gate_clamp_frac", clamp_frac)
+            _telemetry_max("gate_chunk_drop_max", (-gk.detach()).amax())
+        if guard_on:
+            # Trigger on the clamp ENGAGEMENT RATE, not the worst cell: the
+            # per-channel amax is init-dominated (instant-forget channels sit
+            # beyond the clamp from step 0, harmlessly). Calibrate the
+            # threshold against a healthy-run telemetry baseline. An optional
+            # absolute trigger on the exact anchored operand is available via
+            # GDN2_GATE_ARG_MAX (off unless set).
+            frac_max = float(_os.environ.get("GDN2_GATE_CLAMP_FRAC_MAX", "0.1"))
+            arg_env = _os.environ.get("GDN2_GATE_ARG_MAX", "")
+            triggered = float(clamp_frac) > frac_max
+            if not triggered and arg_env:
+                triggered = float(anchor_arg) > float(arg_env)
+            if triggered:
+                exact_intra = True
+                _telemetry_count("gate_guard_triggers")
+                global _GUARD_WARNED
+                if not _GUARD_WARNED:
+                    _GUARD_WARNED = True
+                    warnings.warn(
+                        "GDN2_GATE_RANGE_GUARD: anchored-clamp engagement "
+                        f"(frac {float(clamp_frac):.3f}, arg_max "
+                        f"{float(anchor_arg):.1f} log2) exceeded its "
+                        "threshold; routing this call through the exact "
+                        "token-parallel intra (warning once; count in "
+                        "gdn2_telemetry_snapshot()['gate_guard_triggers'])."
+                    )
     if (_os.environ.get("GDN2_FWD_IMPL", "cuda_fused").lower() == "cuda_fused"
-            and _os.environ.get("GDN2_EXACT_INTRA", "0") != "1"
+            and not exact_intra
             and not safe_gate and cu_seqlens is None
             and BT == 64 and K == 128 and v.shape[-1] == 128
             and B * H <= 65535  # grid is dim3(NT, B*H); y capped at 65535
@@ -902,11 +1046,11 @@ def chunk_gdn2_fwd_intra(
     Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
 
     # Step 1: build the diagonal Akk sub-blocks (and full Aqk) in fp32.
-    # The sub-chunk tensor-core kernel is exact for any gates (anchored
-    # normalization); the token-parallel scalar kernel remains as an escape
-    # hatch via GDN2_EXACT_INTRA=1.
-    import os as _os
-    if not (_os.environ.get("GDN2_EXACT_INTRA", "0") == "1" and not safe_gate):
+    # The sub-chunk tensor-core kernel uses anchored normalization (exact
+    # while sub-chunk gate ranges stay under its clamp); the token-parallel
+    # scalar kernel is exact for ANY gates and serves as the escape hatch
+    # (GDN2_EXACT_INTRA=1 or a gate-range-guard trigger).
+    if not exact_intra:
         grid = (NT, triton.cdiv(BT, BC), B * H)
         BK = triton.next_power_of_2(K)
         chunk_gdn2_fwd_kernel_intra_sub_chunk[grid](
@@ -959,7 +1103,7 @@ def chunk_gdn2_fwd_intra(
         K=K,
         BT=BT,
         BC=BC,
-        USE_SAFE_GATE=not (_os.environ.get("GDN2_EXACT_INTRA", "0") == "1" and not safe_gate),
+        USE_SAFE_GATE=not exact_intra,
     )
 
     # Step 3: Build w = A @ (b * exp(gk) * k)  and  u = A @ (wg * v).
@@ -1142,8 +1286,13 @@ def chunk_gdn2_fwd(
     if fuse_o:
         # With o fused and recompute on, the per-chunk states and v_new are
         # dropped right after this call (the backward re-materializes them),
-        # so their stores are pure write traffic — skip them.
-        _drop_hv = disable_recompute is False and not return_intermediate_states
+        # so their stores are pure write traffic — skip them. Telemetry needs
+        # h materialized to observe the state amax, so it keeps the store.
+        _drop_hv = (
+            disable_recompute is False
+            and not return_intermediate_states
+            and not _telemetry_enabled()
+        )
         h, v_new, final_state, o = chunk_gated_delta_rule_fwd_h(
             k=kg,
             w=w,
@@ -1191,6 +1340,11 @@ def chunk_gdn2_fwd(
             chunk_indices=chunk_indices,
             state_v_first=transpose_state_layout,
         )
+
+    if _telemetry_enabled():
+        if h is not None:
+            _telemetry_max("state_amax", h.detach().abs().amax())
+        _telemetry_max("o_amax", o.detach().abs().amax())
 
     if disable_recompute is False:
         # Free memory we don't need to retain for the current path.
